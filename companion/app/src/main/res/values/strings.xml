@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pebble Remote Harness</string>
+    <string name="ongoing_channel">Connection</string>
+    <string name="ongoing_text">Watching for prompts</string>
+    <string name="alerts_channel">Prompts</string>
+</resources>
