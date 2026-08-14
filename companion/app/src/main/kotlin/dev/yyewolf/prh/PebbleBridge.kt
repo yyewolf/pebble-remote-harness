@@ -10,10 +10,13 @@ import java.util.UUID
  * listening while the app is closed. [wakeWatchApp] is the only mechanism
  * that launches a closed watchapp without the user tapping anything.
  *
- * EVERYTHING HERE IS UNVERIFIED. Classic PebbleKit talks to the official
- * Pebble Android app over an intent surface (com.getpebble.action.*), and the
- * Core Devices app is a rewrite. Run the probe in docs/android-companion.md
- * before writing real code against this class.
+ * Compatibility is **verified** against coredevices.coreapp 1.8.0.7: the
+ * classic com.getpebble.action.* surface is registered at runtime (so it is
+ * absent from the app's manifest but present in its dex), and the classic
+ * content provider answers live queries. See docs/android-companion.md.
+ *
+ * Use classic, not PebbleKit 2: only classic exposes app.START, and launching
+ * a closed watchapp is the one capability this project cannot do without.
  */
 class PebbleBridge(private val context: Context) {
 

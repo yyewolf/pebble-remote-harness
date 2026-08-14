@@ -10,11 +10,13 @@
          late, or not at all. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-    <!-- Android 11+ package visibility: PebbleKit resolves intents against
-         the Pebble app, so it must be visible to us.
-         TODO: confirm the Core Devices app's package name. -->
+    <!-- Android 11+ package visibility. The Core Devices app is
+         `coredevices.coreapp`, NOT the classic `com.getpebble.android.basalt`
+         that still appears inside its dex — naming the old one leaves the
+         provider lookup returning nothing. Verified against 1.8.0.7. -->
     <queries>
-        <package android:name="com.getpebble.android.basalt" />
+        <package android:name="coredevices.coreapp" />
+        <provider android:authorities="com.getpebble.android.provider.basalt" />
     </queries>
 
     <application

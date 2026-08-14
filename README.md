@@ -82,20 +82,26 @@ leaving ~125K of heap.
 
 ## Before writing more code
 
-Two things are unresolved, and one of them can invalidate real work:
+The design questions are settled. What remains is implementation, plus one
+end-to-end test.
 
-1. **Does the Core Devices mobile app still implement the classic PebbleKit
-   Android intent surface?** The entire companion design rests on it. The
-   probe is in [docs/android-companion.md](docs/android-companion.md). Settle
-   this first.
-2. **The exact reply request bodies** for Kilo's permission and question
-   endpoints. They are in the live `/doc` spec; nobody has transcribed them.
+Resolved along the way, each by probing rather than assuming:
 
-Server discovery *was* on this list and is now settled: Kilo Code spawns one
-server per VSCode window with a random port and its own password, both
-readable from `/proc/<pid>/environ`, and `KILO_PARENT_PID` ties each server to
-the window that owns it. See
-[docs/kilo-integration.md](docs/kilo-integration.md#discovery).
+- **PebbleKit compatibility.** The Core Devices app (`coredevices.coreapp`
+  1.8.0.7) supports classic PebbleKit. Its manifest declares no receivers,
+  which looks fatal, but it registers them at runtime and the dex carries the
+  full `com.getpebble.action.*` set including `app.START`. Its classic content
+  provider answers live queries: watch connected, AppMessage supported,
+  firmware 4.33.2. See
+  [android-companion.md](docs/android-companion.md#compatibility-verified).
+- **Server discovery.** Not needed — the plugin runs inside each kilo server.
+- **The permission event shape.** `permission.asked`, not the v2 name, with
+  different field names throughout.
+- **Reply bodies.** `{"reply": "once"|"always"|"reject"}`.
+
+Still to prove: sideload `watchapp.pbw`, fire `app.START` with our UUID, and
+confirm the app opens on the wrist. Reading an API surface is not the same as
+exercising it.
 
 Also worth knowing: Kilo's API is undocumented and unstable, so a Kilo upgrade
 can break the integration. `api/internal/kilo` is deliberately the only place
