@@ -296,3 +296,145 @@ func TestRegisterUpstream(t *testing.T) {
 		t.Fatal("upstream still found after remove")
 	}
 }
+
+func TestReplyQueuesDecision(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/home/me/infra", 0)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{
+			Kind:      "permission",
+			RequestID: "per_1",
+			SessionID: "ses_1",
+			Action:    "bash",
+			Resources: []string{"ls"},
+		},
+	})
+
+	// Get the envelope ID from the poll.
+	pollResp, _ := h.Poll(context.Background(), 0, 0)
+	envID := pollResp.Events[0].ID
+
+	err := h.Reply(protocol.ReplyRequest{EventID: envID, Action: protocol.ActionOnce})
+	if err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+
+	// The plugin should see the decision.
+	decResp, err := h.PollDecisions(context.Background(), upID, 0, 0)
+	if err != nil {
+		t.Fatalf("poll decisions: %v", err)
+	}
+	if len(decResp.Decisions) != 1 {
+		t.Fatalf("decisions = %d, want 1", len(decResp.Decisions))
+	}
+	dec := decResp.Decisions[0]
+	if dec.RequestID != "per_1" {
+		t.Errorf("request_id = %q, want per_1", dec.RequestID)
+	}
+	if dec.Action != protocol.ActionOnce {
+		t.Errorf("action = %q, want once", dec.Action)
+	}
+	if dec.Nonce == "" {
+		t.Error("empty nonce")
+	}
+}
+
+func TestReplyAlreadyAnswered(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/home/me/infra", 0)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{
+			Kind:      "permission",
+			RequestID: "per_1",
+			SessionID: "ses_1",
+			Action:    "bash",
+			Resources: []string{"ls"},
+		},
+	})
+
+	pollResp, _ := h.Poll(context.Background(), 0, 0)
+	envID := pollResp.Events[0].ID
+
+	if err := h.Reply(protocol.ReplyRequest{EventID: envID, Action: protocol.ActionOnce}); err != nil {
+		t.Fatalf("first reply: %v", err)
+	}
+
+	// Second reply must fail — idempotent, not double-approve.
+	err := h.Reply(protocol.ReplyRequest{EventID: envID, Action: protocol.ActionAlways})
+	if err != ErrAlreadyAnswered {
+		t.Fatalf("second reply: err = %v, want ErrAlreadyAnswered", err)
+	}
+
+	// Only one decision should be queued.
+	decResp, _ := h.PollDecisions(context.Background(), upID, 0, 0)
+	if len(decResp.Decisions) != 1 {
+		t.Fatalf("decisions = %d, want 1", len(decResp.Decisions))
+	}
+	if decResp.Decisions[0].Action != protocol.ActionOnce {
+		t.Errorf("action = %q, want once (first)", decResp.Decisions[0].Action)
+	}
+}
+
+func TestReplyUnknownEvent(t *testing.T) {
+	h := New(50)
+	err := h.Reply(protocol.ReplyRequest{EventID: "evt_bogus", Action: protocol.ActionOnce})
+	if err != ErrAlreadyAnswered {
+		t.Fatalf("err = %v, want ErrAlreadyAnswered", err)
+	}
+}
+
+func TestPollDecisionsLongPollWakes(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/home/me/infra", 0)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{
+			Kind:      "permission",
+			RequestID: "per_1",
+			SessionID: "ses_1",
+			Action:    "bash",
+			Resources: []string{"ls"},
+		},
+	})
+	pollResp, _ := h.Poll(context.Background(), 0, 0)
+	envID := pollResp.Events[0].ID
+
+	done := make(chan protocol.DecisionsResponse, 1)
+	go func() {
+		resp, err := h.PollDecisions(context.Background(), upID, 0, 5*time.Second)
+		if err != nil {
+			t.Errorf("poll decisions: %v", err)
+		}
+		done <- resp
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	h.Reply(protocol.ReplyRequest{EventID: envID, Action: protocol.ActionReject})
+
+	select {
+	case resp := <-done:
+		if len(resp.Decisions) != 1 {
+			t.Fatalf("decisions = %d, want 1", len(resp.Decisions))
+		}
+		if resp.Decisions[0].Action != protocol.ActionReject {
+			t.Errorf("action = %q, want reject", resp.Decisions[0].Action)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("decision long-poll did not wake")
+	}
+}
+
+func TestPollDecisionsContextCancel(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/home/me/infra", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go cancel()
+
+	_, err := h.PollDecisions(ctx, upID, 0, 5*time.Second)
+	if err != context.Canceled {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
