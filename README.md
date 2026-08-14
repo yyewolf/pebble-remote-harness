@@ -62,17 +62,20 @@ RAM against a 128K budget, leaving ~125K of heap.
 
 ## Before writing more code
 
-Three things are unresolved, and two of them can invalidate real work:
+Two things are unresolved, and one of them can invalidate real work:
 
 1. **Does the Core Devices mobile app still implement the classic PebbleKit
    Android intent surface?** The entire companion design rests on it. The
    probe is in [docs/android-companion.md](docs/android-companion.md). Settle
    this first.
-2. **How does the extension find the port of the `kilo serve` instance Kilo
-   Code spawned?** Candidates: Kilo's state directory, `--mdns` discovery, or
-   having `prh` spawn its own instance.
-3. **The exact reply request bodies** for Kilo's permission and question
+2. **The exact reply request bodies** for Kilo's permission and question
    endpoints. They are in the live `/doc` spec; nobody has transcribed them.
+
+Server discovery *was* on this list and is now settled: Kilo Code spawns one
+server per VSCode window with a random port and its own password, both
+readable from `/proc/<pid>/environ`, and `KILO_PARENT_PID` ties each server to
+the window that owns it. See
+[docs/kilo-integration.md](docs/kilo-integration.md#discovery).
 
 Also worth knowing: Kilo's API is undocumented and unstable, so a Kilo upgrade
 can break the integration. `api/internal/kilo` is deliberately the only place
