@@ -102,8 +102,11 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
         plugin_version: PLUGIN_VERSION,
         kilo_version: process.env.KILO_VERSION || "unknown",
         directory,
-        project_id: project,
-        parent_pid: process.env.KILO_PARENT_PID ? parseInt(process.env.KILO_PARENT_PID, 10) : null,
+        // `project` is an object — {id, worktree, vcs, time, sandboxes} — not
+        // a string. Sending it whole makes prh reject the hello as a malformed
+        // body, and the plugin then fails open into permanent silence.
+        project_id: (project && project.id) || "",
+        parent_pid: process.env.KILO_PARENT_PID ? parseInt(process.env.KILO_PARENT_PID, 10) : 0,
       })
       if (status === 409) {
         // Protocol mismatch: stay disabled. Guessing at a format we do not
