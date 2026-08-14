@@ -1,12 +1,93 @@
 # Wire protocol
 
-Two hops, two encodings.
+Three hops, three trust levels.
 
 ```
-prh  --JSON over HTTP-->  companion  --AppMessage dict-->  watchapp
+kilo plugin  --unix socket-->  prh  --JSON over HTTP-->  companion  --AppMessage-->  watchapp
+   in-process                  no Kilo creds            LAN, token           Bluetooth
 ```
 
 Version: `v1`. Breaking changes bump the path prefix.
+
+## Hop 0 — plugin ↔ `prh` (JSON over a unix socket)
+
+Not on the network. Served on `AF_UNIX` at
+`${XDG_RUNTIME_DIR:-~/.local/state}/prh/plugin.sock`, in a `0700` directory,
+with a peer-UID check on accept. Rationale and threat model in `plugin.md`.
+
+No credentials cross this channel in either direction. `prh` never learns a
+Kilo password and cannot call Kilo's API.
+
+### `POST /plugin/v1/hello`
+
+```jsonc
+// request
+{ "protocol": "v1",
+  "plugin_version": "0.1.0",
+  "kilo_version": "7.4.22",
+  "directory": "/home/you/workspace/infra",  // becomes the watch's label
+  "project_id": "69d07a1c…",
+  "parent_pid": 2025346 }                    // extension host, or null outside VSCode
+
+// 200
+{ "upstream_id": "up_3f9a", "server_name": "workstation", "protocol": "v1" }
+// 409 on protocol mismatch — fail loudly, never guess
+```
+
+`(parent_pid, directory)` identifies an upstream. Re-registering replaces it,
+which is exactly what a VSCode reload produces.
+
+### `POST /plugin/v1/events`
+
+Uplink, batched, fire-and-forget. The plugin must not block a turn waiting for
+this; a bounded queue that drops on overflow is correct.
+
+```jsonc
+{ "upstream_id": "up_3f9a",
+  "events": [
+    { "kind": "permission",        // permission | question | idle | error
+      "request_id": "per_01H…",    // the ID a decision must match
+      "session_id": "ses_01H…",
+      "action": "bash",
+      "resources": ["rm -rf build/"],
+      "can_save": true }           // whether "always" is offered
+  ] }
+```
+
+`prh` truncates to the limits below and turns these into envelopes.
+
+### `GET /plugin/v1/decisions?upstream_id=…&cursor=…&wait=…`
+
+Downlink long-poll. The plugin holds this open and applies what arrives.
+
+```jsonc
+{ "cursor": 12,
+  "decisions": [
+    { "id": "dec_7",
+      "request_id": "per_01H…",   // must be pending and plugin-forwarded
+      "session_id": "ses_01H…",
+      "kind": "permission",
+      "action": "once",           // once | always | reject | choice | text
+      "choice": 0,
+      "text": "",
+      "nonce": "9f2c…",           // dedupe; a retry must not double-approve
+      "expires": 1765400000 }
+  ] }
+```
+
+Rules the plugin enforces, not `prh` — see `plugin.md`: unknown or
+already-answered `request_id` is dropped, repeated `nonce` is dropped, expiry
+means *leave pending* rather than approve, and `allow-everything` is not a
+representable action.
+
+### `POST /plugin/v1/ack`
+
+Reports what was applied, so `prh` can stop retrying and tell the watch.
+
+```jsonc
+{ "upstream_id": "up_3f9a", "id": "dec_7", "status": "applied" }
+// status: applied | rejected | expired | unknown_request
+```
 
 ## Hop 1 — `prh` ↔ companion (JSON/HTTP)
 
@@ -85,15 +166,18 @@ are truncated by `prh`, not by the companion, so truncation is consistent.
 // 200 {"ok":true}   409 if already answered or expired
 ```
 
-`prh` maps this onto the right Kilo endpoint — `POST
-/permission/{id}/reply`, `/permission/{id}/always-rules`, or
-`/api/session/{sid}/question/{id}/reply`. The companion stays ignorant of
-Kilo's shapes.
+`prh` does not call Kilo. It turns this into a decision on Hop 0 and the
+plugin applies it, so the companion stays ignorant of Kilo's shapes and `prh`
+stays incapable of anything the plugin does not offer.
+
+`200` means the decision was queued, not that it was applied — the plugin's
+`ack` is what confirms that. The watch should show "sent" until the ack
+arrives.
 
 ### `POST /v1/prompt`
 
-Dictation that starts new work rather than answering a prompt. Forwards to
-`POST /session/{sessionID}/prompt_async`.
+Dictation that starts new work rather than answering a prompt. Becomes a
+`kind: "prompt"` decision on Hop 0.
 
 ```jsonc
 { "session": "ses_ab12", "text": "run the tests again" }
@@ -103,27 +187,6 @@ Dictation that starts new work rather than answering a prompt. Forwards to
 
 Unauthenticated liveness, for the extension's status bar. Returns version,
 uptime, connected Kilo instances, registered device count. No secrets.
-
-### `POST /admin/upstream` — loopback only
-
-Kilo Code spawns one server per VSCode window, each with a random port and
-its own password, both rotating on every reload. Upstreams therefore cannot
-come from static config: each window's extension discovers its own server and
-registers it here.
-
-```jsonc
-{ "name": "infra",                       // project label, for the watch
-  "base_url": "http://127.0.0.1:4096",
-  "password": "...",                     // KILO_SERVER_PASSWORD
-  "parent_pid": 2025346 }                // extension host, the identity key
-```
-
-Re-registering the same `parent_pid` replaces the entry, which is what a
-VSCode reload produces. `DELETE /admin/upstream/{parent_pid}` drops it.
-
-**This endpoint must bind loopback only.** It accepts a Kilo password in
-plaintext and is not part of the surface the companion talks to. It is
-separate from device auth: the extension is trusted by being on the box.
 
 ## Hop 2 — companion ↔ watchapp (AppMessage)
 
@@ -173,11 +236,30 @@ Dictation uses the PT2 microphone via the `dictation` API, producing
 
 ## Security
 
-- The password is stored **hashed** (argon2id) in `prh` config; the plaintext
-  lives only in VSCode `SecretStorage`.
+Each hop has its own trust level, and the design keeps the strongest secret on
+the innermost one. Full threat model in `plugin.md`.
+
+**Hop 0 (plugin ↔ `prh`)** — never on the network.
+
+- `AF_UNIX` socket in a `0700` directory, peer UID verified on accept.
+- Carries no credentials in either direction. `prh` holds no Kilo password and
+  cannot call Kilo's API; the four decision kinds are its entire reach.
+- Decisions carry a nonce so a retry cannot become a second approval, and
+  expiry means *leave pending*, never *approve*.
+
+**Hop 1 (`prh` ↔ companion)** — the exposed surface.
+
+- The pairing password is stored **hashed** (argon2id) in `prh` config; the
+  plaintext lives only in VSCode `SecretStorage`.
 - Registration is rate-limited; repeated failures lock out the source IP.
 - Device tokens are independently revocable from the extension.
-- Traffic is plaintext HTTP. This is a LAN-trust design. Off-LAN, put it
-  behind Tailscale rather than exposing the port — do not port-forward it.
 - `prh` binds `0.0.0.0` by default because the phone must reach it. Narrow
   this to the LAN interface if the host is multi-homed.
+- **Traffic is plaintext HTTP, and envelope bodies are command lines and file
+  paths.** This is the weakest link in the design. LAN-trust only; off-LAN,
+  put it behind Tailscale rather than port-forwarding. The intended fix is a
+  self-signed certificate whose fingerprint travels in the pairing QR, so the
+  companion can pin it without a CA.
+
+**Hop 2 (companion ↔ watch)** — Bluetooth, and out of our hands. Anyone who
+can see your wrist can read what the agent proposed.
