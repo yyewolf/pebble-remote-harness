@@ -103,15 +103,46 @@ that already protect the socket. Do not add security theatre.
 
 ## Installation lifecycle
 
-Kilo's global plugins are npm modules in `~/.config/kilo/package.json`
-(already carries `@kilocode/plugin`), installed with:
-
-```bash
-kilo plugin -g @yyewolf/prh-plugin
-```
-
 Global means **every window and every project**, including agent sessions that
 have nothing to do with the harness.
+
+### What actually loads a plugin
+
+Measured on Kilo 7.4.22, because none of it was guessable:
+
+- **`~/.config/kilo/opencode.json` is the file that works.** Its `plugin`
+  array is read and honoured.
+- **`~/.config/kilo/kilo.jsonc`'s `plugin` array is ignored.** Verified by
+  removing the entry from `opencode.json` while leaving it in `kilo.jsonc`:
+  the plugin stopped loading entirely. Everything *else* in `kilo.jsonc`
+  (model, providers, permissions) is honoured, which makes this trap
+  convincing — the file plainly works, just not for plugins.
+- **An absolute path resolves; a bare package name is what `kilo plugin -g`
+  writes.** The working entry is
+  `/home/yewolf/.config/kilo/node_modules/@yyewolf/prh-plugin`.
+- There are **two** global module roots, `~/.config/kilo/node_modules` and
+  `~/.kilocode/node_modules`, and the instance bootstrap reads config from
+  `~/.kilocode/` as well. Only the `~/.config/kilo` absolute path was proven.
+
+Confirm a load by watching `upstreams` in `GET /v1/health` — it increments
+when the plugin's `hello` lands. Kilo logs **nothing** on plugin load,
+success or failure, so the daemon is the only observable signal.
+
+### `kilo plugin -g` cannot install this plugin
+
+```
+$ kilo plugin -g @yyewolf/prh-plugin
+■  404 Not Found - GET https://registry.npmjs.org/@yyewolf%2fprh-plugin
+```
+
+It resolves from npm only. Until the package is published, installing means
+linking the module into a global root and adding its absolute path to
+`opencode.json` by hand. `extension/src/kiloPlugin.ts` still shells out to
+`kilo plugin -g` and will therefore fail — see the note there.
+
+Also note `kilo plugin` has **no subcommands**: `kilo plugin list` treats
+`list` as a module name and writes `{"plugin": ["list"]}` into the local
+`.kilo/opencode.json`.
 
 ### The extension must not install it silently
 
@@ -124,8 +155,15 @@ The flow:
    `~/.config/kilo/package.json` and comparing the pinned version.
 2. If missing or stale, it surfaces a non-modal prompt — never a silent fix.
 3. `Pebble Harness: Install Kilo plugin` states plainly that this affects all
-   projects, then runs `kilo plugin -g @yyewolf/prh-plugin@<pinned>`.
+   projects, then installs.
 4. `Pebble Harness: Remove Kilo plugin` reverses it.
+
+Steps 1 and 3 are both wrong as implemented. Detection reads the npm
+`dependencies` map, where a local install appears as
+`"file:../../workspace/…"` and parses to a junk version, so a working install
+reports as `outdated`. Installation shells out to `kilo plugin -g`, which
+404s for an unpublished package. Fixing this means choosing: publish to npm,
+or have the extension write `opencode.json` itself.
 
 Version is pinned by the extension, not floated. The plugin sends its protocol
 version in `hello`; `prh` rejects a mismatch loudly rather than guessing.
