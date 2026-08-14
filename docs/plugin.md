@@ -184,10 +184,10 @@ line of defence:
 
 ## Open questions
 
-- The `permission.ask` hook signature is **unverified** — triggering one needs
-  a real model call. The `event` hook is verified. Prefer `event` for
-  observation; investigate `permission.ask` only if intercepting beats
-  observing.
+- ~~The `permission.ask` hook signature is unverified.~~ **Settled**: probed
+  against a real prompt, `permission.ask` does not fire in Kilo 7.4.22. Use
+  the `event` hook and translate the v1 `permission.asked` payload. See
+  `kilo-integration.md`.
 - Whether `~/.config/kilo/plugins/*.js` is a supported global location. A file
   placed there loaded correctly, then the directory was pruned — the npm
   dependency route is the documented one and the one to rely on.

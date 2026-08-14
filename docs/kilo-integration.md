@@ -47,21 +47,87 @@ the same secret the watch holds — see `protocol.md`.
 ## Events we consume
 
 `GET /event` is an SSE stream (`text/event-stream`) carrying ~200 event types.
-Four matter:
+The plugin sees the same bus through its `event` hook.
+
+**`permission.asked` is what actually fires — not `permission.v2.asked`.**
+Both are declared in the OpenAPI schema, and the v2 name is the tempting one,
+but a live permission prompt on Kilo 7.4.22 emits the v1 shape. Captured
+verbatim from a real `bash` prompt:
+
+```jsonc
+{
+  "id": "per_0020638b70010OokT5yF5718FJ",
+  "sessionID": "ses_ffdf9cdc3ffegilIaGS5r4iI8J",
+  "permission": "bash",                 // the action — NOT "action"
+  "patterns": ["ls -la"],               // the resource — NOT "resources"
+  "metadata": {
+    "command": "ls -la",
+    "description": "List files in current directory"
+  },
+  "always": ["ls *"],                   // what "Always" would grant — NOT "save"
+  "tool": { "messageID": "msg_…", "callID": "chatcmpl-tool-…" }
+}
+```
+
+Three details that matter:
+
+- **`always` is a pattern, not the command.** Choosing "always" here approves
+  `ls *`, not `ls -la`. The watch must show the pattern, or the user is
+  consenting to something broader than what they read.
+- **`metadata.description`** is a human sentence and is often better on a
+  200px screen than the raw command.
+- Field names differ from v2 throughout. Translate from v1.
 
 | Event | Payload | Becomes |
 |---|---|---|
-| `permission.v2.asked` | `{id, sessionID, action, resources[], save[], metadata, source}` | `perm` envelope |
-| `question.v2.asked` | `{id, sessionID, questions[], tool}` | `ques` envelope |
+| `permission.asked` | above | `perm` envelope |
+| `permission.replied` | `{sessionID, requestID, reply}` | **retracts** the envelope |
+| `question.asked` | `{id, sessionID, …}` | `ques` envelope |
 | `session.idle` | `{sessionID}` | `idle` envelope |
 | `session.error` | `{sessionID, error}` | `err` envelope |
 
-Legacy `permission.asked` and `question.asked` also exist with different
-shapes (`{id, sessionID, permission, patterns[], metadata, always[], tool}`).
-Handle both; prefer v2.
+`permission.replied` was an unexpected find and is worth handling: it fires
+when a prompt is answered *anywhere*, including in the VSCode UI. Without it
+the watch keeps asking a question that has already been settled at the desk.
 
 Everything else — `session.next.text.delta`, `message.part.updated`, LSP
 diagnostics, PTY traffic — is dropped at the hub.
+
+## Replying
+
+```jsonc
+// POST /permission/{requestID}/reply     ← the one we use
+{ "reply": "once" | "always" | "reject",  // required
+  "message": "…",                          // optional
+  "interactive": true }                    // optional
+
+// POST /permission/{requestID}/always-rules
+{ "approvedAlways": ["ls *"], "deniedAlways": [] }
+
+// POST /session/{sessionID}/permissions/{permissionID}   ← older variant
+{ "response": "once" | "always" | "reject" }
+```
+
+Query parameters `directory` and `workspace` are accepted on all three.
+
+## Plugin hooks
+
+Probed against a real permission prompt. Of the candidate hook names:
+
+| Hook | Fires? | Signature |
+|---|---|---|
+| `event` | **yes** | `({ event })` — the whole bus |
+| `tool.execute.before` | **yes** | `({tool, sessionID, callID}, {args})` |
+| `permission.ask` | **no** | did not fire |
+| `permission.asked` | **no** | did not fire |
+
+So **observe the bus; do not try to intercept the prompt.** `permission.ask`
+appears in the binary's strings but is not delivered to plugins in 7.4.22.
+
+`tool.execute.before` does fire and its second argument is mutable — writing
+to `output.args` would rewrite the command the agent is about to run. We do
+not use it. Rewriting a command out from under a user who is about to approve
+it would defeat the entire point of asking.
 
 ## Endpoints we call
 
@@ -149,9 +215,6 @@ Useful as a fallback hint, wrong as a source of truth.
 
 ## Open questions
 
-- **Reply body shapes.** The exact request bodies for the reply endpoints are
-  in `/doc` but have not been transcribed here. Pull them from the live spec
-  before implementing `kilo/client.go`.
 - **Stability.** None of this is documented or supported. A Kilo upgrade can
   break it. The `kilo` package is deliberately the only place that knows these
   details.
