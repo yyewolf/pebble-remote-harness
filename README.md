@@ -1,0 +1,92 @@
+# pebble-remote-harness
+
+Approve your coding agent's permission prompts from a Pebble Time 2, and get
+told when a session stops.
+
+> **Status: scaffold.** Every component's structure, wire protocol, and open
+> questions are written down. Almost no behaviour is implemented — the Go
+> daemon builds and serves `/v1/health`, and everything else returns 501 or
+> throws `NotImplementedError`. See [Current state](#current-state).
+
+## How it works
+
+```
+kilo serve  ──SSE──▶  prh (Go)  ──long-poll──▶  Android companion  ──BLE──▶  Pebble Time 2
+```
+
+Kilo Code ships a headless [opencode](https://opencode.ai) server that already
+emits `permission.v2.asked`, `question.v2.asked`, `session.idle`, and
+`session.error` — so the hard part, hooking into the agent's approval flow,
+needs no patching. `prh` collapses that ~200-event-type firehose into five
+watch-sized envelopes and holds them in a replayable queue. The Android
+companion carries the network because PebbleKit JS is killed whenever the
+watchapp closes; it calls `startAppOnPebble()` to wake the watch when a prompt
+lands.
+
+Full detail in [docs/architecture.md](docs/architecture.md).
+
+## Layout
+
+| Path | What |
+|---|---|
+| `api/` | `prh`, the Go daemon. Stdlib only so far. |
+| `extension/` | VSCode extension: owns the password, manages the daemon, shows the pairing QR. |
+| `companion/` | Android app: holds the long-poll, wakes the watchapp. |
+| `watchapp/` | Pebble Time 2 app (`emery`). Pure UI, never speaks HTTP. |
+| `docs/` | Architecture, wire protocol, Kilo findings, wake strategies. |
+
+## Docs
+
+- [architecture.md](docs/architecture.md) — the four components and why each exists
+- [protocol.md](docs/protocol.md) — the v1 wire contract, both hops
+- [kilo-integration.md](docs/kilo-integration.md) — what Kilo Code's bundled server exposes, and how it was found
+- [android-companion.md](docs/android-companion.md) — the companion's job, and the probe that must pass first
+- [notifications.md](docs/notifications.md) — waking a closed watchapp, and the fallbacks
+
+## Current state
+
+| Component | Builds here | Implemented |
+|---|---|---|
+| `api/` | yes — `go build ./...`, binary runs | types, config, routing, `/v1/health` |
+| `extension/` | not tried — needs `npm install` | manifest, commands, status bar shape |
+| `companion/` | no — no JDK or Android SDK present | data models only |
+| `watchapp/` | no — no Pebble SDK present | UI skeleton, button map, AppMessage decode |
+
+## Before writing more code
+
+Three things are unresolved, and two of them can invalidate real work:
+
+1. **Does the Core Devices mobile app still implement the classic PebbleKit
+   Android intent surface?** The entire companion design rests on it. The
+   probe is in [docs/android-companion.md](docs/android-companion.md). Settle
+   this first.
+2. **How does the extension find the port of the `kilo serve` instance Kilo
+   Code spawned?** Candidates: Kilo's state directory, `--mdns` discovery, or
+   having `prh` spawn its own instance.
+3. **The exact reply request bodies** for Kilo's permission and question
+   endpoints. They are in the live `/doc` spec; nobody has transcribed them.
+
+Also worth knowing: Kilo's API is undocumented and unstable, so a Kilo upgrade
+can break the integration. `api/internal/kilo` is deliberately the only place
+that knows those shapes.
+
+## Building
+
+```bash
+make api          # go build
+make extension    # npm install && tsc
+make watchapp     # pebble build   (needs the Pebble SDK)
+make companion    # gradle assembleDebug  (needs JDK + Android SDK)
+```
+
+## Security
+
+The password you set in the extension is a LAN-trust credential, and traffic
+is plaintext HTTP. Off-LAN, put it behind Tailscale — do not port-forward it.
+Three secrets stay separate: Kilo's `KILO_SERVER_PASSWORD` never leaves the
+dev box, the pairing password is stored hashed and typed once, and the phone
+holds only a revocable device token.
+
+## License
+
+MIT
