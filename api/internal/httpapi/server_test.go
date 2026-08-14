@@ -460,3 +460,59 @@ func TestPluginDecisionsBadUpstream(t *testing.T) {
 		t.Fatalf("status = %d, want 400", w.Code)
 	}
 }
+
+func TestRegisterRateLimited(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+
+	// Use a low-threshold limiter for the test.
+	srv.rateLimiter = newRateLimiter(3, 5*time.Minute)
+
+	for i := 0; i < 3; i++ {
+		w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+			Password: "wrong",
+		}, "")
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status = %d, want 401", i, w.Code)
+		}
+	}
+
+	// 4th attempt should be locked out.
+	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+		Password: "secret",
+	}, "")
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", w.Code)
+	}
+}
+
+func TestRegisterRateLimitResetOnSuccess(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	srv.rateLimiter = newRateLimiter(3, 5*time.Minute)
+
+	// Two failures — under threshold.
+	for i := 0; i < 2; i++ {
+		doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+			Password: "wrong",
+		}, "")
+	}
+
+	// Correct password succeeds and resets.
+	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+		Password:   "secret",
+		DeviceName: "dev",
+		Platform:   "android",
+	}, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+
+	// Counter is reset: two more failures should not lock out.
+	for i := 0; i < 2; i++ {
+		w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+			Password: "wrong",
+		}, "")
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("post-reset attempt %d: status = %d, want 401", i, w.Code)
+		}
+	}
+}

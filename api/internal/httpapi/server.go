@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yyewolf/pebble-remote-harness/api/internal/auth"
@@ -27,15 +28,21 @@ type Server struct {
 	devices *auth.Registry
 	log     *slog.Logger
 	started time.Time
+
+	// rateLimiter tracks failed registration attempts per source IP. The
+	// pairing password is the only secret an attacker can guess at, so this
+	// is the only endpoint that needs it.
+	rateLimiter *rateLimiter
 }
 
 func New(cfg config.Config, h *hub.Hub, devices *auth.Registry, log *slog.Logger) *Server {
 	return &Server{
-		cfg:     cfg,
-		hub:     h,
-		devices: devices,
-		log:     log,
-		started: time.Now(),
+		cfg:         cfg,
+		hub:         h,
+		devices:     devices,
+		log:         log,
+		started:      time.Now(),
+		rateLimiter: newRateLimiter(5, 5*time.Minute),
 	}
 }
 
@@ -179,9 +186,17 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleRegister trades the pairing password for a device token.
 //
-// TODO (M3): rate-limit by source IP — this is the only endpoint where an
-// attacker can guess. Repeated failures should lock the IP out.
+// Rate-limited by source IP: this is the only endpoint where an attacker can
+// guess. After maxAttempts failures within the window, the IP is locked out
+// until the oldest attempt expires.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+
+	if s.rateLimiter.isLocked(ip) {
+		writeErr(w, http.StatusTooManyRequests, "too many attempts, try again later")
+		return
+	}
+
 	var req protocol.RegisterRequest
 	if !decodeJSON(w, r, &req) {
 		return
@@ -193,16 +208,17 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	if err := s.devices.VerifyPassword(req.Password); err != nil {
 		if errors.Is(err, auth.ErrBadPassword) {
+			s.rateLimiter.recordFailure(ip)
 			writeErr(w, http.StatusUnauthorized, "bad password")
-			return
-		}
-		if errors.Is(err, auth.ErrRateLimited) {
-			writeErr(w, http.StatusTooManyRequests, "too many attempts")
 			return
 		}
 		writeErr(w, http.StatusInternalServerError, "auth error")
 		return
 	}
+
+	// Success: clear the IP's failure history so a legitimate user who
+	// mistyped a few times is not penalised after a successful pairing.
+	s.rateLimiter.reset(ip)
 
 	deviceID, token, err := s.devices.Register(req.DeviceName, req.Platform)
 	if err != nil {
@@ -342,4 +358,64 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 		return false
 	}
 	return true
+}
+
+// clientIP extracts the remote address, stripping any port. Under VSCode
+// Remote this is the remote host's address, which is correct — the phone
+// reaches that host, not the VSCode client.
+func clientIP(r *http.Request) string {
+	host := r.RemoteAddr
+	if i := strings.LastIndex(host, ":"); i > 0 {
+		host = host[:i]
+	}
+	return host
+}
+
+// rateLimiter tracks failed attempts per IP within a sliding window. After
+// maxAttempts failures, the IP is locked until the oldest failure expires.
+type rateLimiter struct {
+	mu         sync.Mutex
+	maxAttempts int
+	window     time.Duration
+	failures   map[string][]time.Time
+}
+
+func newRateLimiter(maxAttempts int, window time.Duration) *rateLimiter {
+	return &rateLimiter{
+		maxAttempts: maxAttempts,
+		window:      window,
+		failures:    make(map[string][]time.Time),
+	}
+}
+
+func (rl *rateLimiter) isLocked(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return len(rl.recentLocked(ip)) >= rl.maxAttempts
+}
+
+func (rl *rateLimiter) recordFailure(ip string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	rl.failures[ip] = append(rl.failures[ip], time.Now())
+}
+
+func (rl *rateLimiter) reset(ip string) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	delete(rl.failures, ip)
+}
+
+// recentLocked returns failures within the window. Must be called with mu held.
+func (rl *rateLimiter) recentLocked(ip string) []time.Time {
+	cutoff := time.Now().Add(-rl.window)
+	fails := rl.failures[ip]
+	out := fails[:0]
+	for _, f := range fails {
+		if f.After(cutoff) {
+			out = append(out, f)
+		}
+	}
+	rl.failures[ip] = out
+	return out
 }
