@@ -44,41 +44,70 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/reply", s.authed(s.handleReply))
 	mux.HandleFunc("POST /v1/prompt", s.authed(s.handlePrompt))
 
-	// Upstream registration. Kilo's port and password rotate on every VSCode
-	// reload, so each window's extension registers its own server here.
-	mux.HandleFunc("POST /admin/upstream", s.loopbackOnly(s.handleAddUpstream))
-	mux.HandleFunc("DELETE /admin/upstream/{parentPID}", s.loopbackOnly(s.handleDropUpstream))
+	return mux
+}
+
+// PluginHandler is the Hop 0 surface, served **only** on the unix socket.
+//
+// It is a separate handler from Handler() on purpose: nothing here may ever
+// be reachable from the network. Wiring these routes into the TCP mux would
+// expose upstream registration and the decision queue to the LAN.
+func (s *Server) PluginHandler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /plugin/v1/hello", s.handlePluginHello)
+	mux.HandleFunc("POST /plugin/v1/events", s.handlePluginEvents)
+	mux.HandleFunc("GET /plugin/v1/decisions", s.handlePluginDecisions)
+	mux.HandleFunc("POST /plugin/v1/ack", s.handlePluginAck)
 
 	return mux
 }
 
-// loopbackOnly rejects anything not from 127.0.0.1 or ::1.
+// handlePluginHello registers one kilo server, keyed by (parent_pid,
+// directory).
 //
-// The admin surface carries Kilo passwords in plaintext and has no token
-// auth: the extension is trusted by virtue of running on this machine. That
-// only holds if it cannot be reached from the LAN, unlike the /v1 surface.
-//
-// TODO: implement. Parse r.RemoteAddr and compare against loopback; do not
-// trust X-Forwarded-For here.
-func (s *Server) loopbackOnly(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeErr(w, http.StatusNotImplemented, "admin surface not implemented")
+// TODO: implement.
+//   - reject a protocol mismatch with 409 rather than guessing
+//   - re-registering the same key replaces the entry; that is a window reload
+//   - bind the upstream to this connection so that a dropped socket, which is
+//     what a closing window produces, drops the upstream
+//   - derive the project label from filepath.Base(Directory)
+func (s *Server) handlePluginHello(w http.ResponseWriter, r *http.Request) {
+	var req protocol.PluginHello
+	if !decodeJSON(w, r, &req) {
+		return
 	}
+	writeErr(w, http.StatusNotImplemented, "plugin hello not implemented")
 }
 
-// handleAddUpstream registers or replaces one kilo serve instance, keyed by
-// the extension host PID that spawned it.
+// handlePluginEvents ingests the uplink batch and publishes envelopes.
 //
-// TODO: implement. Re-registering an existing parent_pid must replace the
-// entry and restart that upstream's SSE consumer — that is what a window
-// reload looks like from here.
-func (s *Server) handleAddUpstream(w http.ResponseWriter, r *http.Request) {
-	writeErr(w, http.StatusNotImplemented, "add upstream not implemented")
+// TODO: implement. This must never block: the plugin is inside the user's
+// agent and a slow response here is a stalled coding session.
+func (s *Server) handlePluginEvents(w http.ResponseWriter, r *http.Request) {
+	var req protocol.PluginEvents
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	writeErr(w, http.StatusNotImplemented, "plugin events not implemented")
 }
 
-// handleDropUpstream removes an upstream whose window has closed.
-func (s *Server) handleDropUpstream(w http.ResponseWriter, r *http.Request) {
-	writeErr(w, http.StatusNotImplemented, "drop upstream not implemented")
+// handlePluginDecisions is the downlink long-poll the plugin holds open.
+//
+// TODO: implement. Only hand an upstream the decisions addressed to it —
+// one window's plugin must never be able to apply another window's approval.
+func (s *Server) handlePluginDecisions(w http.ResponseWriter, r *http.Request) {
+	writeErr(w, http.StatusNotImplemented, "plugin decisions not implemented")
+}
+
+// handlePluginAck records what the plugin actually applied, which is what
+// stops retries and what tells the watch the approval landed.
+func (s *Server) handlePluginAck(w http.ResponseWriter, r *http.Request) {
+	var req protocol.DecisionAck
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	writeErr(w, http.StatusNotImplemented, "plugin ack not implemented")
 }
 
 // handleHealth is unauthenticated and must never leak secrets.
@@ -88,6 +117,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		UptimeSec: int64(time.Since(s.started).Seconds()),
 		Upstreams: s.hub.Upstreams(),
 		Devices:   s.devices.Count(),
+		// Listen lets a second window detect that the running daemon was
+		// started with settings other than its own, and warn rather than
+		// restart a daemon the other windows are using.
+		Listen: s.cfg.Listen,
+		Paired: s.cfg.PasswordHash != "",
 	})
 }
 

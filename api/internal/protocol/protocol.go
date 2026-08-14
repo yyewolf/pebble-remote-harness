@@ -44,6 +44,7 @@ func (t EventType) NeedsReply() bool {
 // Field limits. prh truncates so that truncation is consistent everywhere;
 // the companion must not re-truncate.
 const (
+	MaxProject = 24
 	MaxTitle   = 32
 	MaxBody    = 256
 	MaxChoice  = 24
@@ -53,14 +54,23 @@ const (
 // Envelope is one watch-sized event. Kept small: every field eventually
 // crosses Bluetooth.
 type Envelope struct {
-	ID      string    `json:"id"`
-	Seq     uint64    `json:"seq"`
-	Type    EventType `json:"type"`
-	Session string    `json:"session"`
-	Title   string    `json:"title"`
-	Body    string    `json:"body"`
-	Choices []string  `json:"choices,omitempty"`
-	Expires int64     `json:"expires,omitempty"` // unix seconds
+	ID   string    `json:"id"`
+	Seq  uint64    `json:"seq"`
+	Type EventType `json:"type"`
+
+	// Project names the window that is asking. One prh serves every VSCode
+	// window, so without this the watch cannot tell which repository wants to
+	// run the command it is about to approve.
+	Project string `json:"project"`
+
+	// Session is opaque; it routes dictation back to the right session and
+	// means nothing to a human.
+	Session string `json:"session"`
+
+	Title   string   `json:"title"`
+	Body    string   `json:"body"`
+	Choices []string `json:"choices,omitempty"`
+	Expires int64    `json:"expires,omitempty"` // unix seconds
 }
 
 // ReplyAction is how the user answered.
@@ -109,9 +119,77 @@ type PromptRequest struct {
 }
 
 // Health is the unauthenticated liveness payload. Must never carry secrets.
+//
+// Listen and Bind let a second VSCode window notice that the running daemon
+// was started with different settings than its own, so it can warn instead of
+// restarting a daemon other windows are using.
 type Health struct {
 	Version   string `json:"version"`
 	UptimeSec int64  `json:"uptime_sec"`
 	Upstreams int    `json:"upstreams"`
 	Devices   int    `json:"devices"`
+	Listen    string `json:"listen"`
+	Paired    bool   `json:"paired"`
+}
+
+// -- Hop 0: the plugin channel, served on a unix socket ---------------------
+
+// PluginHello registers one kilo server. Identity is (ParentPID, Directory);
+// the connection's lifetime is the upstream's lifetime.
+type PluginHello struct {
+	Protocol      string `json:"protocol"`
+	PluginVersion string `json:"plugin_version"`
+	KiloVersion   string `json:"kilo_version"`
+	Directory     string `json:"directory"`
+	ProjectID     string `json:"project_id"`
+	ParentPID     int    `json:"parent_pid"`
+}
+
+type PluginHelloResponse struct {
+	UpstreamID string `json:"upstream_id"`
+	ServerName string `json:"server_name"`
+	Protocol   string `json:"protocol"`
+}
+
+// PluginEvent is one upstream occurrence, before translation to an Envelope.
+type PluginEvent struct {
+	Kind      string   `json:"kind"` // permission | question | idle | error
+	RequestID string   `json:"request_id"`
+	SessionID string   `json:"session_id"`
+	Action    string   `json:"action"`
+	Resources []string `json:"resources,omitempty"`
+	CanSave   bool     `json:"can_save,omitempty"`
+}
+
+type PluginEvents struct {
+	UpstreamID string        `json:"upstream_id"`
+	Events     []PluginEvent `json:"events"`
+}
+
+// Decision is an answer travelling back to the plugin, which applies it.
+//
+// Nonce exists so that a retry cannot become a second approval, and Expires
+// resolves to "leave pending" rather than "approve".
+type Decision struct {
+	ID        string      `json:"id"`
+	RequestID string      `json:"request_id"`
+	SessionID string      `json:"session_id"`
+	Kind      string      `json:"kind"` // permission | question | prompt | abort
+	Action    ReplyAction `json:"action"`
+	Choice    int         `json:"choice,omitempty"`
+	Text      string      `json:"text,omitempty"`
+	Nonce     string      `json:"nonce"`
+	Expires   int64       `json:"expires"`
+}
+
+type DecisionsResponse struct {
+	Cursor    uint64     `json:"cursor"`
+	Decisions []Decision `json:"decisions"`
+}
+
+// DecisionAck reports what the plugin actually did.
+type DecisionAck struct {
+	UpstreamID string `json:"upstream_id"`
+	ID         string `json:"id"`
+	Status     string `json:"status"` // applied | rejected | expired | unknown_request
 }

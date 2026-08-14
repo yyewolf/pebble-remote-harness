@@ -24,8 +24,17 @@ type Config struct {
 	// ServerName is shown in the companion's pairing screen.
 	ServerName string `json:"server_name"`
 
-	// Upstreams are the kilo serve instances to consume events from.
-	Upstreams []Upstream `json:"upstreams"`
+	// SocketPath is the plugin channel: an AF_UNIX socket in a 0700
+	// directory. It carries no credentials and is never on the network. It is
+	// also the singleton token — a window that can connect to it adopts the
+	// running daemon instead of starting a second one.
+	SocketPath string `json:"socket_path"`
+
+	// Upstreams is the fallback for a standalone prh with no plugin
+	// installed. The plugin path needs none of this: plugins register
+	// themselves over SocketPath, and Kilo's ports and passwords rotate on
+	// every VSCode reload anyway. See docs/plugin.md.
+	Upstreams []Upstream `json:"upstreams,omitempty"`
 
 	// RingSize bounds the per-device replay buffer.
 	RingSize int `json:"ring_size"`
@@ -48,9 +57,27 @@ func Default() Config {
 	return Config{
 		Listen:         "0.0.0.0:8477",
 		ServerName:     hostname(),
+		SocketPath:     DefaultSocketPath(),
 		RingSize:       200,
 		MaxPollWaitSec: 55,
 	}
+}
+
+// DefaultSocketPath prefers XDG_RUNTIME_DIR, which is already per-user and
+// mode 0700, and is cleaned up on logout.
+//
+// The plugin computes this same path independently — it cannot be passed one,
+// since it is loaded by Kilo and not by us. Any change here must be mirrored
+// in plugin/.
+func DefaultSocketPath() string {
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return dir + "/prh/plugin.sock"
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "prh.sock"
+	}
+	return home + "/.local/state/prh/plugin.sock"
 }
 
 // ErrNoPassword means the daemon has never been paired.

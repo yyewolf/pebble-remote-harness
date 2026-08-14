@@ -16,9 +16,11 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -92,6 +94,22 @@ func run(args []string) error {
 		}
 	}()
 
+	// The plugin channel. Never on the network: wiring these routes into the
+	// TCP listener would expose upstream registration to the LAN.
+	pluginLn, err := listenPluginSocket(cfg.SocketPath)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(cfg.SocketPath)
+
+	pluginSrv := &http.Server{Handler: api.PluginHandler()}
+	go func() {
+		if err := pluginSrv.Serve(pluginLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("plugin socket stopped", "err", err)
+		}
+	}()
+	log.Info("plugin socket listening", "path", cfg.SocketPath)
+
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           api.Handler(),
@@ -106,6 +124,7 @@ func run(args []string) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
+		_ = pluginSrv.Shutdown(shutdownCtx)
 	}()
 
 	log.Info("prh listening", "addr", cfg.Listen, "version", version, "protocol", protocol.Version)
@@ -115,6 +134,48 @@ func run(args []string) error {
 
 	log.Info("prh stopped")
 	return nil
+}
+
+// listenPluginSocket binds the plugin channel, enforcing the singleton.
+//
+// There is one prh per user per machine — the phone pairs with one endpoint
+// and sees every window. The socket is the election token: if something
+// answers on it, a daemon is already running and this process must not start
+// a second one. If the file exists but refuses connections, it is the debris
+// of a crash and is safe to remove.
+func listenPluginSocket(path string) (net.Listener, error) {
+	dir := filepath.Dir(path)
+	// 0700: the directory permission is what authenticates us to the plugin,
+	// since only this user can place a socket at this path.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("creating %s: %w", dir, err)
+	}
+
+	if _, err := os.Stat(path); err == nil {
+		conn, derr := net.DialTimeout("unix", path, time.Second)
+		if derr == nil {
+			conn.Close()
+			return nil, fmt.Errorf("another prh is already running on %s", path)
+		}
+		// Refused or timed out: stale socket from a crash.
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("removing stale socket: %w", err)
+		}
+	}
+
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, fmt.Errorf("listening on %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("securing %s: %w", path, err)
+	}
+
+	// TODO: verify peer UID on accept (SO_PEERCRED on Linux, LOCAL_PEERCRED
+	// on macOS). The 0700 directory already excludes other users; this turns
+	// that assumption into a checked fact.
+	return ln, nil
 }
 
 func defaultConfigPath() string {
