@@ -36,10 +36,14 @@ class SettingsActivity : Activity() {
     private lateinit var pairButton: Button
     private val scope = CoroutineScope(Dispatchers.Main)
 
+    private var deepLinkHost: String? = null
+    private var deepLinkPort: Int = -1
+    private var deepLinkPw: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        handleDeepLink(intent)
+        parseDeepLink(intent)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -47,67 +51,74 @@ class SettingsActivity : Activity() {
             gravity = Gravity.CENTER_HORIZONTAL
         }
 
+        val hostLabel = TextView(this).apply { text = "Host" }
         hostField = EditText(this).apply {
-            hint = "Host (e.g. 192.168.1.10)"
+            hint = "e.g. 192.168.1.10"
             inputType = InputType.TYPE_CLASS_TEXT
+            maxLines = 1
         }
+        val portLabel = TextView(this).apply { text = "Port" }
         portField = EditText(this).apply {
-            hint = "Port"
+            hint = "8477"
             inputType = InputType.TYPE_CLASS_NUMBER
             setText("8477")
+            maxLines = 1
         }
+        val pwLabel = TextView(this).apply { text = "Password" }
         passwordField = EditText(this).apply {
-            hint = "Password"
+            hint = "Pairing password"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            maxLines = 1
         }
         pairButton = Button(this).apply { text = "Pair" }
         statusText = TextView(this).apply { text = "Not paired" }
 
+        root.addView(hostLabel)
         root.addView(hostField)
+        root.addView(portLabel)
         root.addView(portField)
+        root.addView(pwLabel)
         root.addView(passwordField)
         root.addView(pairButton)
         root.addView(statusText)
         setContentView(root)
 
         prefill()
-
         pairButton.setOnClickListener { doPair() }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleDeepLink(intent)
+        parseDeepLink(intent)
         prefill()
     }
 
     // -- deep link ---------------------------------------------------------
 
-    private var deepLinkPw: String? = null
-
-    private fun handleDeepLink(intent: Intent?) {
+    private fun parseDeepLink(intent: Intent?) {
         val data = intent?.data ?: return
         if (data.scheme != "prh") return
-        val host = data.host ?: return
-        val port = data.port
+        deepLinkHost = data.host
+        deepLinkPort = data.port
         deepLinkPw = data.getQueryParameter("pw")
-
-        hostField.setText(host)
-        if (port > 0) portField.setText(port.toString())
     }
 
     private fun prefill() {
-        PrhPrefs.getBaseUrl(this)?.let { url ->
-            val parsed = Uri.parse(url)
-            hostField.setText(parsed.host)
-            parsed.port.takeIf { it > 0 }?.let { portField.setText(it.toString()) }
+        deepLinkHost?.let { hostField.setText(it) }
+        if (deepLinkPort > 0) portField.setText(deepLinkPort.toString())
+
+        if (deepLinkHost == null) {
+            PrhPrefs.getBaseUrl(this)?.let { url ->
+                val parsed = Uri.parse(url)
+                hostField.setText(parsed.host)
+                parsed.port.takeIf { it > 0 }?.let { portField.setText(it.toString()) }
+            }
         }
+
         if (PrhPrefs.isPaired(this)) {
             statusText.text = "Paired"
         }
-        if (deepLinkPw != null) {
-            passwordField.setText(deepLinkPw)
-        }
+        deepLinkPw?.let { passwordField.setText(it) }
     }
 
     // -- pairing -----------------------------------------------------------
