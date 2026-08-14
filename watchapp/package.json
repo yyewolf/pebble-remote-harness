@@ -1,0 +1,38 @@
+{
+  "name": "pebble-remote-harness",
+  "author": "yyewolf",
+  "version": "0.1.0",
+  "private": true,
+  "keywords": [
+    "pebble-app"
+  ],
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Remote Harness",
+    "uuid": "630aaa1e-ad28-4694-950d-a25105a7390b",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "emery"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "messageKeys": [
+      "EVENT_ID",
+      "EVENT_TYPE",
+      "SESSION",
+      "TITLE",
+      "BODY",
+      "CHOICES",
+      "STATUS",
+      "REPLY_ID",
+      "REPLY_ACTION",
+      "REPLY_CHOICE",
+      "REPLY_TEXT"
+    ],
+    "resources": {
+      "media": []
+    }
+  }
+}
