@@ -105,24 +105,54 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
 
   return {
     /**
-     * Observation only. The event hook is verified to fire; permission.ask is
-     * not, so prefer watching the bus over intercepting it.
+     * The only hook we use.
+     *
+     * Probed against a real prompt on Kilo 7.4.22: `permission.ask` never
+     * fires, so there is nothing to intercept — we observe the bus instead.
+     * `tool.execute.before` does fire and can rewrite the command about to
+     * run; we deliberately do not use it. Rewriting a command out from under
+     * someone who is about to approve it defeats the point of asking.
      *
      * Wrapped so a throw can never escape into Kilo.
      */
     event: async ({ event }) => {
       try {
         if (state.stopped || !state.upstreamId) return
+        const p = event.properties || {}
 
         switch (event.type) {
-          case "permission.v2.asked":
+          // v1 is what actually fires. Field names are permission/patterns/
+          // always — NOT the action/resources/save of the v2 schema.
           case "permission.asked":
-            // TODO: record in state.pending, then report()
+            state.pending.set(p.id, { sessionID: p.sessionID })
+            report({
+              kind: "permission",
+              request_id: p.id,
+              session_id: p.sessionID,
+              action: p.permission,
+              resources: p.patterns,
+              description: p.metadata?.description,
+              // Broader than the command: "ls -la" approved with always
+              // grants "ls *". prh shows it on the choice.
+              always: p.always,
+            })
             break
-          case "question.v2.asked":
+
+          // Fires when a prompt is answered anywhere, including the VSCode
+          // UI. Retracts it from the watch instead of asking twice.
+          case "permission.replied":
+            state.pending.delete(p.requestID)
+            report({
+              kind: "replied",
+              request_id: p.requestID,
+              session_id: p.sessionID,
+            })
+            break
+
           case "question.asked":
             // TODO: record in state.pending, then report()
             break
+
           case "session.idle":
           case "session.error":
             // TODO: report() — notification only, no reply expected

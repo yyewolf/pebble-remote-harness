@@ -13,11 +13,16 @@ const Version = "v1"
 type EventType string
 
 const (
-	EventPerm EventType = "perm" // permission.v2.asked  -> needs a reply
-	EventQues EventType = "ques" // question.v2.asked    -> needs a reply
+	EventPerm EventType = "perm" // permission.asked     -> needs a reply
+	EventQues EventType = "ques" // question.asked       -> needs a reply
 	EventIdle EventType = "idle" // session.idle         -> notify only
 	EventErr  EventType = "err"  // session.error        -> notify only
 	EventNote EventType = "note" // internal status      -> notify only
+
+	// EventGone retracts a prompt answered elsewhere, e.g. in the VSCode UI.
+	// Driven by Kilo's permission.replied. Without it the watch keeps asking
+	// a question already settled at the desk.
+	EventGone EventType = "gone"
 )
 
 // Wire returns the uint8 the watchapp expects for this type.
@@ -31,6 +36,8 @@ func (t EventType) Wire() uint8 {
 		return 3
 	case EventErr:
 		return 4
+	case EventGone:
+		return 6
 	default:
 		return 5
 	}
@@ -152,13 +159,29 @@ type PluginHelloResponse struct {
 }
 
 // PluginEvent is one upstream occurrence, before translation to an Envelope.
+//
+// Field names follow Kilo's live permission.asked payload rather than its v2
+// schema, because v1 is what actually fires. See docs/kilo-integration.md.
 type PluginEvent struct {
-	Kind      string   `json:"kind"` // permission | question | idle | error
-	RequestID string   `json:"request_id"`
-	SessionID string   `json:"session_id"`
-	Action    string   `json:"action"`
+	// Kind is permission | question | idle | error | replied.
+	Kind      string `json:"kind"`
+	RequestID string `json:"request_id"`
+	SessionID string `json:"session_id"`
+
+	// Action is Kilo's "permission" field, e.g. "bash".
+	Action string `json:"action,omitempty"`
+
+	// Resources is Kilo's "patterns" field, e.g. ["ls -la"].
 	Resources []string `json:"resources,omitempty"`
-	CanSave   bool     `json:"can_save,omitempty"`
+
+	// Description is metadata.description, a human sentence that often reads
+	// better than the raw command on a 200px screen.
+	Description string `json:"description,omitempty"`
+
+	// Always is what choosing "always" would grant — a pattern, broader than
+	// the command. "ls -la" approved with always grants "ls *". Show it, or
+	// the user consents to more than they read.
+	Always []string `json:"always,omitempty"`
 }
 
 type PluginEvents struct {

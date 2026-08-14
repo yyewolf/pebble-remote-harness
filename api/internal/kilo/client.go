@@ -16,13 +16,22 @@ import (
 var ErrNotImplemented = errors.New("kilo: not implemented")
 
 // Upstream event type strings we care about. Everything else is dropped.
+//
+// Verified against a live prompt on Kilo 7.4.22: the **v1** names are what
+// actually fire. The v2 names are declared in the OpenAPI schema and are the
+// tempting choice, but nothing emits them; translating from v2 yields empty
+// envelopes. See docs/kilo-integration.md.
 const (
-	TypePermissionAsked   = "permission.v2.asked"
-	TypeQuestionAsked     = "question.v2.asked"
+	TypePermissionAsked   = "permission.asked"
+	TypePermissionReplied = "permission.replied"
+	TypeQuestionAsked     = "question.asked"
 	TypeSessionIdle       = "session.idle"
 	TypeSessionError      = "session.error"
-	TypePermissionAskedV1 = "permission.asked" // legacy shape, different fields
-	TypeQuestionAskedV1   = "question.asked"
+
+	// Declared but not observed. Kept so a future Kilo that starts emitting
+	// them is recognised rather than silently ignored.
+	TypePermissionAskedV2 = "permission.v2.asked"
+	TypeQuestionAskedV2   = "question.v2.asked"
 )
 
 // Event is one decoded SSE frame. Properties stays raw so the hub can decode
@@ -33,13 +42,40 @@ type Event struct {
 	Properties json.RawMessage `json:"properties"`
 }
 
-// PermissionAsked is the payload of permission.v2.asked.
+// PermissionAsked is the payload of permission.asked, captured verbatim from
+// a live bash prompt.
 type PermissionAsked struct {
-	ID        string   `json:"id"`        // "per..."
-	SessionID string   `json:"sessionID"` // "ses..."
-	Action    string   `json:"action"`
-	Resources []string `json:"resources"`
-	Save      []string `json:"save"`
+	ID        string `json:"id"`        // "per..."
+	SessionID string `json:"sessionID"` // "ses..."
+
+	// Permission is the action, e.g. "bash". Named "permission", not "action".
+	Permission string `json:"permission"`
+
+	// Patterns is the resource, e.g. ["ls -la"].
+	Patterns []string `json:"patterns"`
+
+	// Metadata carries "command" and a human "description", the latter often
+	// reading better than the raw command on a 200px screen.
+	Metadata map[string]any `json:"metadata"`
+
+	// Always is what choosing "always" would grant — a *pattern*, broader
+	// than the command. Approving "ls -la" with always grants "ls *". The
+	// watch must display this, or the user consents to more than they read.
+	Always []string `json:"always"`
+
+	Tool struct {
+		MessageID string `json:"messageID"`
+		CallID    string `json:"callID"`
+	} `json:"tool"`
+}
+
+// PermissionReplied fires when a prompt is answered anywhere, including in
+// the VSCode UI. It is how a prompt already settled at the desk gets
+// retracted from the watch instead of being asked twice.
+type PermissionReplied struct {
+	SessionID string `json:"sessionID"`
+	RequestID string `json:"requestID"`
+	Reply     string `json:"reply"` // once | always | reject
 }
 
 // QuestionAsked is the payload of question.v2.asked.
@@ -87,13 +123,27 @@ func (c *Client) Events(ctx context.Context) (<-chan Event, error) {
 	return nil, ErrNotImplemented
 }
 
+// PermissionReply is the body of POST /permission/{requestID}/reply.
+type PermissionReply struct {
+	Reply       string `json:"reply"` // once | always | reject — required
+	Message     string `json:"message,omitempty"`
+	Interactive bool   `json:"interactive,omitempty"`
+}
+
+// AlwaysRules is the body of POST /permission/{requestID}/always-rules.
+type AlwaysRules struct {
+	ApprovedAlways []string `json:"approvedAlways,omitempty"`
+	DeniedAlways   []string `json:"deniedAlways,omitempty"`
+}
+
 // ReplyPermission answers a permission request.
 //
-// Endpoint: POST /permission/{requestID}/reply
-// For "always", also POST /permission/{requestID}/always-rules.
+// Endpoint: POST /permission/{requestID}/reply, body PermissionReply.
+// Both accept optional `directory` and `workspace` query parameters.
 //
-// TODO: pull the exact request body from /doc before implementing.
-func (c *Client) ReplyPermission(ctx context.Context, requestID string, allow bool, always bool) error {
+// TODO: implement. "always" persists the broader Always pattern from the
+// request, so only send it when the user was actually shown that pattern.
+func (c *Client) ReplyPermission(ctx context.Context, requestID string, reply PermissionReply) error {
 	return ErrNotImplemented
 }
 

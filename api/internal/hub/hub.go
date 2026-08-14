@@ -77,13 +77,17 @@ func (h *Hub) Run(ctx context.Context) error {
 // Translate converts an upstream event into an envelope. The bool is false
 // for the ~195 event types the watch does not care about.
 //
-// TODO: implement the mapping in docs/protocol.md:
+// TODO: implement the mapping in docs/protocol.md, translating the **v1**
+// payloads — v2 never fires:
 //
-//	permission.v2.asked -> perm, Title=action, Body=resources[0], choices
-//	                       Approve/Always/Reject (Always only when Save is set)
-//	question.v2.asked   -> ques, choices from QuestionV2Info
-//	session.idle        -> idle, notify only
-//	session.error       -> err,  notify only
+//	permission.asked   -> perm, Title=permission, Body=patterns[0]
+//	                      choices Approve / Always / Reject
+//	                      the Always choice must name the pattern it grants,
+//	                      e.g. "Always: ls *" — it is broader than the command
+//	permission.replied -> gone, retracts a prompt answered in the VSCode UI
+//	question.asked     -> ques, choices from the question payload
+//	session.idle       -> idle, notify only
+//	session.error      -> err,  notify only
 //
 // Truncate to protocol.MaxTitle / MaxBody here, so truncation is consistent
 // for every consumer.
