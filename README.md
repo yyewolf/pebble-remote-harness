@@ -47,13 +47,18 @@ Full detail in [docs/architecture.md](docs/architecture.md).
 
 | Component | Builds here | Implemented |
 |---|---|---|
-| `api/` | yes — `go build ./...`, binary runs | types, config, routing, `/v1/health` |
-| `extension/` | not tried — needs `npm install` | manifest, commands, status bar shape |
-| `companion/` | no — no JDK or Android SDK present | data models only |
-| `watchapp/` | yes — `pebble build` produces `watchapp.pbw` | UI skeleton, button map, AppMessage decode |
+| `api/` | yes — `bin/prh` runs | types, config, routing, `/v1/health` |
+| `extension/` | yes — `tsc` clean | manifest, commands, status bar shape |
+| `companion/` | yes — `app-debug.apk`, 4.0 MB | data models only |
+| `watchapp/` | yes — `watchapp.pbw`, 17 KB | UI skeleton, button map, AppMessage decode |
 
-The watchapp compiles against Pebble SDK 4.33.1 for `emery` and uses 2810
-bytes of RAM, leaving ~125K of heap — the memory budget is a non-issue here.
+`make all` builds all four from clean. Toolchain versions and install paths
+are in [docs/toolchain.md](docs/toolchain.md) — everything lives in `$HOME`
+and none of it needed root.
+
+Building is not working: every component compiles, and almost none of it
+does anything yet. The watchapp does at least fit comfortably — 2810 bytes of
+RAM against a 128K budget, leaving ~125K of heap.
 
 ## Before writing more code
 
