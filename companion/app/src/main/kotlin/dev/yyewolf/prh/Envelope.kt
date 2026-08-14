@@ -10,6 +10,12 @@ data class Envelope(
     val id: String,
     val seq: Long,
     val type: EventType,
+    /**
+     * Which VSCode window is asking. One prh serves them all, so approving
+     * the right command in the wrong repository is a real hazard — the watch
+     * must show this.
+     */
+    val project: String,
     val session: String,
     val title: String,
     val body: String,

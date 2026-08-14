@@ -27,15 +27,16 @@ class PebbleBridge(private val context: Context) {
         // reordering that array silently breaks the wire otherwise.
         const val KEY_EVENT_ID = 0
         const val KEY_EVENT_TYPE = 1
-        const val KEY_SESSION = 2
-        const val KEY_TITLE = 3
-        const val KEY_BODY = 4
-        const val KEY_CHOICES = 5
-        const val KEY_STATUS = 6
-        const val KEY_REPLY_ID = 7
-        const val KEY_REPLY_ACTION = 8
-        const val KEY_REPLY_CHOICE = 9
-        const val KEY_REPLY_TEXT = 10
+        const val KEY_PROJECT = 2
+        const val KEY_SESSION = 3
+        const val KEY_TITLE = 4
+        const val KEY_BODY = 5
+        const val KEY_CHOICES = 6
+        const val KEY_STATUS = 7
+        const val KEY_REPLY_ID = 8
+        const val KEY_REPLY_ACTION = 9
+        const val KEY_REPLY_CHOICE = 10
+        const val KEY_REPLY_TEXT = 11
 
         const val CHOICE_SEPARATOR = '\u001F'
     }

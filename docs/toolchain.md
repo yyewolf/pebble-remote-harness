@@ -69,6 +69,9 @@ curl -s https://dl.google.com/android/repository/repository2-3.xml \
   install pins `--python 3.12`.
 - **`emery` vs `gabbro`.** Both are modern platforms in SDK 4.33.1. The Pebble
   Time 2 is `emery`; gabbro is 260x260 and round.
+- **Editing `messageKeys` needs `pebble clean`.** Waf does not treat
+  `package.json` as an input to the message-key codegen, so a new key fails to
+  compile as `'MESSAGE_KEY_X' undeclared` against a stale generated header.
 
 ## Build everything
 

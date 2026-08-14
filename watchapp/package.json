@@ -21,6 +21,7 @@
     "messageKeys": [
       "EVENT_ID",
       "EVENT_TYPE",
+      "PROJECT",
       "SESSION",
       "TITLE",
       "BODY",

@@ -26,6 +26,7 @@ typedef enum {
   REPLY_TEXT = 5,
 } ReplyAction;
 
+#define MAX_PROJECT 25
 #define MAX_TITLE 33
 #define MAX_BODY 257
 #define MAX_ID 33
@@ -37,6 +38,9 @@ typedef enum {
 static struct {
   char id[MAX_ID];
   EventType type;
+  // Which VSCode window is asking. One prh serves every window, so approving
+  // the right command against the wrong repository is a real mistake to make.
+  char project[MAX_PROJECT];
   char title[MAX_TITLE];
   char body[MAX_BODY];
   char choices[MAX_CHOICES][MAX_CHOICE_LEN];
@@ -46,6 +50,7 @@ static struct {
 } s_current;
 
 static Window *s_window;
+static TextLayer *s_project_layer;
 static TextLayer *s_title_layer;
 static TextLayer *s_body_layer;
 static TextLayer *s_hint_layer;
@@ -127,6 +132,7 @@ static void start_dictation(void) {
 //    list is navigable
 //  - idle/err/note: no reply affordances, dismiss on any button
 static void render_current(void) {
+  text_layer_set_text(s_project_layer, s_current.project);
   text_layer_set_text(s_title_layer, s_current.title);
   text_layer_set_text(s_body_layer, s_current.body);
 
@@ -167,6 +173,10 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
   strncpy(s_current.id, id->value->cstring, MAX_ID - 1);
   s_current.type = (EventType)type->value->uint8;
 
+  Tuple *project = dict_find(iter, MESSAGE_KEY_PROJECT);
+  if (project != NULL) {
+    strncpy(s_current.project, project->value->cstring, MAX_PROJECT - 1);
+  }
   Tuple *title = dict_find(iter, MESSAGE_KEY_TITLE);
   if (title != NULL) {
     strncpy(s_current.title, title->value->cstring, MAX_TITLE - 1);
@@ -255,12 +265,19 @@ static void window_load(Window *window) {
 
   const int16_t top = STATUS_BAR_LAYER_HEIGHT;
 
-  s_title_layer = text_layer_create(GRect(4, top, bounds.size.w - 8, 32));
+  // The project sits above the action, deliberately: "which repo" has to be
+  // legible before "what command" is read.
+  s_project_layer = text_layer_create(GRect(4, top, bounds.size.w - 8, 20));
+  text_layer_set_font(s_project_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD));
+  text_layer_set_overflow_mode(s_project_layer, GTextOverflowModeTrailingEllipsis);
+  layer_add_child(root, text_layer_get_layer(s_project_layer));
+
+  s_title_layer = text_layer_create(GRect(4, top + 20, bounds.size.w - 8, 32));
   text_layer_set_font(s_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
   text_layer_set_overflow_mode(s_title_layer, GTextOverflowModeTrailingEllipsis);
   layer_add_child(root, text_layer_get_layer(s_title_layer));
 
-  s_body_layer = text_layer_create(GRect(4, top + 34, bounds.size.w - 8, bounds.size.h - top - 62));
+  s_body_layer = text_layer_create(GRect(4, top + 54, bounds.size.w - 8, bounds.size.h - top - 82));
   text_layer_set_font(s_body_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
   text_layer_set_overflow_mode(s_body_layer, GTextOverflowModeWordWrap);
   layer_add_child(root, text_layer_get_layer(s_body_layer));
@@ -275,6 +292,7 @@ static void window_load(Window *window) {
 }
 
 static void window_unload(Window *window) {
+  text_layer_destroy(s_project_layer);
   text_layer_destroy(s_title_layer);
   text_layer_destroy(s_body_layer);
   text_layer_destroy(s_hint_layer);
