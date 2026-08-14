@@ -34,6 +34,10 @@ function socketPath() {
   return join(homedir(), ".local", "state", "prh", "plugin.sock")
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
 export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
   const sock = socketPath()
 
@@ -168,26 +172,77 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
     state.seenNonces.add(decision.nonce)
     state.pending.delete(decision.request_id)
 
-    // TODO: apply via `client`. There is deliberately no branch that calls
+    // Apply via `client`. There is deliberately no branch that calls
     // permission/allow-everything — it is not in the vocabulary and must not
     // become reachable by adding an action here.
-    switch (decision.action) {
-      case "once":
-      case "always":
-      case "reject":
-      case "choice":
-      case "text":
-        return "applied"
-      default:
-        return "rejected"
+    try {
+      switch (decision.action) {
+        case "once":
+        case "always":
+        case "reject":
+          // POST /permission/{requestID}/reply
+          // "always" persists the broader pattern via always-rules in a
+          // future iteration; for now the reply itself is what the agent
+          // sees.
+          await client.permissionReply(decision.request_id, {
+            reply: decision.action,
+            interactive: true,
+          })
+          return "applied"
+
+        case "choice":
+        case "text":
+          // Question replies — endpoint differs from permission replies.
+          await client.questionReply(req.sessionID, decision.request_id, decision.choice, decision.text || "")
+          return "applied"
+
+        default:
+          return "rejected"
+      }
+    } catch {
+      // A failed apply does not get un-deleted from pending: prh will not
+      // re-send (the cursor advanced), and the prompt stays pending in Kilo
+      // exactly as it would without the harness. Fail open.
+      return "rejected"
     }
   }
 
-  // TODO: implement the downlink. Long-poll GET /plugin/v1/decisions, apply
-  // each decision, POST /plugin/v1/ack with the result, reconnect with
-  // backoff. Verified in Kilo 7.4.22: a plugin can hold a background loop
-  // that keeps running after load, which is what this needs.
-  async function downlink() {}
+  // Long-poll GET /plugin/v1/decisions, apply each decision, POST
+  // /plugin/v1/ack with the result, reconnect with backoff. Verified in
+  // Kilo 7.4.22: a plugin can hold a background loop that keeps running
+  // after load, which is what this needs.
+  async function downlink() {
+    let backoff = 1000
+
+    while (!state.stopped) {
+      try {
+        const { status, json } = await get(
+          `/plugin/v1/decisions?upstream_id=${state.upstreamId}&cursor=${state.cursor}&wait=30`,
+        )
+        if (status !== 200 || !json) {
+          backoff = Math.min(backoff * 2, 30000)
+          await sleep(backoff)
+          continue
+        }
+
+        backoff = 1000 // reset on success
+
+        for (const dec of json.decisions || []) {
+          const result = await apply(dec)
+          await post("/plugin/v1/ack", {
+            upstream_id: state.upstreamId,
+            id: dec.id,
+            status: result,
+          }).catch(() => {})
+        }
+
+        state.cursor = json.cursor || state.cursor
+      } catch {
+        backoff = Math.min(backoff * 2, 30000)
+        await sleep(backoff)
+      }
+    }
+  }
 
   await hello()
   if (state.upstreamId) downlink()
