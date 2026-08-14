@@ -42,6 +42,7 @@ extension/out/
 # Pebble watchapp
 watchapp/build/
 *.pbw
+.lock-waf*
 
 # Android companion
 .gradle/
