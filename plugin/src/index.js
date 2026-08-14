@@ -14,9 +14,14 @@
 import { existsSync } from "fs"
 import { homedir } from "os"
 import { join } from "path"
+import http from "http"
 
 const PROTOCOL = "v1"
 const PLUGIN_VERSION = "0.1.0"
+
+// Bounded queue for the fire-and-forget uplink. Dropping on overflow is
+// correct: a slow prh must never block a coding turn.
+const QUEUE_MAX = 64
 
 /**
  * Mirrors config.DefaultSocketPath in api/internal/config. The plugin is
@@ -36,6 +41,46 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
   // The user may simply not be running prh today.
   if (!existsSync(sock)) return {}
 
+  // One HTTP agent per plugin instance, pinned to the unix socket. Every
+  // request to prh reuses this; it is the only transport.
+  const agent = new http.Agent({ socketPath: sock, maxSockets: 1 })
+
+  function post(path, body) {
+    return new Promise((resolve, reject) => {
+      const data = Buffer.from(JSON.stringify(body))
+      const req = http.request(
+        { agent, path, method: "POST", headers: { "content-type": "application/json", "content-length": data.length } },
+        (res) => {
+          let buf = ""
+          res.on("data", (c) => (buf += c))
+          res.on("end", () => {
+            let json = null
+            try { json = buf ? JSON.parse(buf) : null } catch {}
+            resolve({ status: res.statusCode, json })
+          })
+        },
+      )
+      req.on("error", reject)
+      req.end(data)
+    })
+  }
+
+  function get(path) {
+    return new Promise((resolve, reject) => {
+      const req = http.request({ agent, path, method: "GET" }, (res) => {
+        let buf = ""
+        res.on("data", (c) => (buf += c))
+        res.on("end", () => {
+          let json = null
+          try { json = buf ? JSON.parse(buf) : null } catch {}
+          resolve({ status: res.statusCode, json })
+        })
+      })
+      req.on("error", reject)
+      req.end()
+    })
+  }
+
   const state = {
     upstreamId: null,
     // Request IDs this plugin forwarded and that are still open. A decision
@@ -47,20 +92,64 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
     seenNonces: new Set(),
     cursor: 0,
     stopped: false,
+    // Bounded uplink queue. Drops on overflow; never blocks the agent.
+    queue: [],
   }
 
-  // TODO: implement. POST /plugin/v1/hello with { protocol, plugin_version,
-  // kilo_version, directory, project_id, parent_pid: process.env.KILO_PARENT_PID }.
-  // A 409 means protocol mismatch: log once and stay disabled rather than
-  // guessing at a format we do not understand.
   async function hello() {
-    return null
+    try {
+      const { status, json } = await post("/plugin/v1/hello", {
+        protocol: PROTOCOL,
+        plugin_version: PLUGIN_VERSION,
+        kilo_version: process.env.KILO_VERSION || "unknown",
+        directory,
+        project_id: project,
+        parent_pid: process.env.KILO_PARENT_PID ? parseInt(process.env.KILO_PARENT_PID, 10) : null,
+      })
+      if (status === 409) {
+        // Protocol mismatch: stay disabled. Guessing at a format we do not
+        // understand would be worse than silence.
+        return null
+      }
+      if (status !== 200 || !json) return null
+      state.upstreamId = json.upstream_id
+      return json.upstream_id
+    } catch {
+      return null // fail open
+    }
   }
 
-  // TODO: implement. Fire-and-forget POST /plugin/v1/events with a bounded
-  // queue that drops on overflow. Never await this on the agent's path: a
-  // slow prh must not become a stalled turn.
-  function report(event) {}
+  // Fire-and-forget POST /plugin/v1/events with a bounded queue that drops
+  // on overflow. Never await this on the agent's path: a slow prh must not
+  // become a stalled turn.
+  function report(event) {
+    if (!state.upstreamId) return
+    if (state.queue.length >= QUEUE_MAX) {
+      // Drop the oldest to make room; newest events are more relevant.
+      state.queue.shift()
+    }
+    state.queue.push(event)
+    flush()
+  }
+
+  let flushing = false
+  function flush() {
+    if (flushing || state.queue.length === 0) return
+    flushing = true
+    const batch = state.queue.splice(0, state.queue.length)
+    post("/plugin/v1/events", { upstream_id: state.upstreamId, events: batch })
+      .catch(() => {
+        // Fail open: re-queue up to a handful, drop the rest. A dead prh
+        // should not accumulate an unbounded backlog.
+        if (state.queue.length < 8) {
+          state.queue.unshift(...batch.slice(0, 8 - state.queue.length))
+        }
+      })
+      .finally(() => {
+        flushing = false
+        if (state.queue.length > 0) flush()
+      })
+  }
 
   /**
    * Applies one decision from prh.
@@ -150,12 +239,27 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
             break
 
           case "question.asked":
-            // TODO: record in state.pending, then report()
+            state.pending.set(p.id, { sessionID: p.sessionID })
+            report({
+              kind: "question",
+              request_id: p.id,
+              session_id: p.sessionID,
+            })
             break
 
           case "session.idle":
+            report({
+              kind: "idle",
+              session_id: p.sessionID,
+            })
+            break
+
           case "session.error":
-            // TODO: report() — notification only, no reply expected
+            report({
+              kind: "error",
+              session_id: p.sessionID,
+              description: p.error,
+            })
             break
         }
       } catch {
