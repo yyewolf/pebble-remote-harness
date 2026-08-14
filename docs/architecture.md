@@ -8,15 +8,19 @@ session stops.
   VSCode (remote or local)
   ┌──────────────────────────────┐
   │ Kilo Code extension          │
-  │   └─ bin/kilo serve  :4096   │  headless opencode server
-  │        HTTP + SSE, Basic auth│
-  └──────────────┬───────────────┘
-                 │  GET /event   (SSE firehose, ~200 event types)
-                 │  POST /permission/{id}/reply
-                 ▼
+  │   └─ bin/kilo serve  (:0)    │  headless opencode server, random port
+  │        ┌───────────────────┐ │
+  │        │ prh plugin        │ │  plugin/ — runs in-process, holds the
+  │        │ in-process        │ │  credentials and never shares them
+  │        └─────────┬─────────┘ │
+  └──────────────────┼───────────┘
+                     │  POST /plugin/v1/events      (uplink)
+                     │  GET  /plugin/v1/decisions   (downlink long-poll)
+                     │  over a unix socket, 0700 dir
+                     ▼
   ┌──────────────────────────────┐
   │ prh — Go API           :8477 │  this repo, api/
-  │   kilo/   SSE consumer       │
+  │   plugin channel (AF_UNIX)   │  holds NO Kilo credentials
   │   hub/    translate + queue  │
   │   httpapi/ long-poll + auth  │
   └──────────────┬───────────────┘
@@ -38,6 +42,19 @@ session stops.
   │   200x228, 64 colors         │  buttons + dictation
   └──────────────────────────────┘
 ```
+
+## Why a plugin rather than an API client
+
+Kilo Code spawns one server per VSCode window with a random port and a fresh
+64-character password, neither of which is knowable up front. `prh` could
+discover both — the credentials sit in `/proc/<pid>/environ` — but that
+credential grants shell access through the agent, and moving it around is the
+last thing a "secure" design should do. It is also Linux-only.
+
+A plugin runs *inside* each kilo server, so it needs no discovery and shares
+no secrets. `prh` cannot call Kilo's API at all; it can only ask the plugin
+for four scoped operations. See `plugin.md` for the security model and
+`kilo-integration.md` for the superseded fallback.
 
 ## Why the Android companion carries the network
 
@@ -76,12 +93,24 @@ If it does not hold, the fallbacks in `docs/notifications.md` apply and
 Owns all state. Runnable standalone (`prh serve`) so it survives a VSCode
 restart; the extension is a lifecycle manager, not a host.
 
-- `config/`   — bind address, password hash, upstream Kilo URLs
+- `config/`   — bind address, password hash, socket path
 - `protocol/` — wire types shared with the companion and watch
-- `kilo/`     — SSE consumer and reply client for one Kilo instance
 - `hub/`      — event translation, per-device cursors, the acked queue
-- `httpapi/`  — `/v1/register`, `/v1/poll`, `/v1/reply`, `/v1/prompt`
+- `httpapi/`  — `/v1/*` for the companion, `/plugin/v1/*` on the unix socket
+- `kilo/`     — **fallback only.** Direct API client for a standalone `prh`
+  with no plugin installed. Linux-only, and it handles a credential the
+  plugin path never exposes. Deletable once the plugin path is proven.
 - `waker/`    — optional extra alert channels (timeline pins, ntfy)
+
+### `plugin/` — the Kilo plugin
+
+An npm module installed globally with `kilo plugin -g`, so it loads into every
+kilo server on the machine. Pushes permission and question events up to `prh`
+and long-polls for decisions, which it applies through its in-process client.
+
+It is the only component holding Kilo credentials, and it never transmits
+them. It must fail open: no `prh`, no socket, no problem — the coding session
+continues untouched.
 
 Volume, transport, durability, and secret-splitting are why this exists rather
 than pointing the companion straight at `kilo serve`: Kilo emits ~200 event

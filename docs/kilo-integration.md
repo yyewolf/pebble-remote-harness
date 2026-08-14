@@ -82,6 +82,14 @@ GET  /permission                                         pending permissions
 
 ## Discovery
 
+> **Superseded.** The primary integration is the plugin channel in
+> `plugin.md`, which needs no discovery at all: the plugin runs inside the
+> kilo process and already has everything. Everything below is the fallback
+> for a standalone `prh` with no plugin installed, and it is Linux-only.
+>
+> It is also the *less safe* path — it moves a credential that grants shell
+> access. Prefer the plugin.
+
 Kilo Code spawns **one server per VSCode window**, each with its own random
 port and its own password, so discovery is not optional.
 
