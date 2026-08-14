@@ -37,6 +37,15 @@ Kilo password and cannot call Kilo's API.
 `(parent_pid, directory)` identifies an upstream. Re-registering replaces it,
 which is exactly what a VSCode reload produces.
 
+An upstream's lifetime **is** the connection's lifetime: when the window
+closes, the kilo server exits, this socket drops, and `prh` forgets the
+upstream. There is no deregistration call to miss and nothing left stale if
+VSCode is killed rather than closed.
+
+`directory`'s basename becomes the envelope's `project` label. One `prh`
+serves every window, so the watch must be able to tell which repository is
+asking before you approve anything.
+
 ### `POST /plugin/v1/events`
 
 Uplink, batched, fire-and-forget. The plugin must not block a turn waiting for
@@ -138,7 +147,8 @@ are truncated by `prh`, not by the companion, so truncation is consistent.
   "id":      "evt_0042",         // ack target, also the reply target
   "seq":     42,
   "type":    "perm",             // perm | ques | idle | err | note
-  "session": "ses_ab12",
+  "project": "infra",            // <= 24 chars; which window is asking
+  "session": "ses_ab12",         // opaque id, for /v1/prompt routing
   "title":   "bash",             // <= 32 chars, the action
   "body":    "rm -rf build/",    // <= 256 chars, the resource
   "choices": ["Approve", "Always", "Reject"],  // <= 6, <= 24 chars each
@@ -202,7 +212,8 @@ generates `MESSAGE_KEY_*` in C.
 |---|---|---|
 | `EVENT_ID` | string | echoed back in the reply |
 | `EVENT_TYPE` | uint8 | 1 perm, 2 ques, 3 idle, 4 err, 5 note |
-| `SESSION` | string | short label for the header |
+| `PROJECT` | string | which window is asking; shown in the header |
+| `SESSION` | string | opaque session id, for dictation routing |
 | `TITLE` | string | the action |
 | `BODY` | string | the resource, truncated |
 | `CHOICES` | string | `\x1f`-separated, empty when none |

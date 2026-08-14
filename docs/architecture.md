@@ -56,6 +56,73 @@ no secrets. `prh` cannot call Kilo's API at all; it can only ask the plugin
 for four scoped operations. See `plugin.md` for the security model and
 `kilo-integration.md` for the superseded fallback.
 
+## One daemon, many windows
+
+There is exactly **one `prh` per user per machine**. The phone pairs with one
+endpoint and sees every project on it. Windows come and go underneath.
+
+This is the whole reason the extension is a lifecycle manager rather than a
+host: a per-window daemon would mean a per-window port, a per-window pairing,
+and a watch that has to be told which window to listen to.
+
+### Electing the daemon
+
+Every window runs the same logic on activation, and it is safe to run
+concurrently:
+
+1. **Try to connect** to the plugin socket. If it answers, a daemon is
+   already running — adopt it and stop.
+2. If the connection is refused but the socket file exists, it is stale.
+3. **Take an exclusive `flock`** on `…/prh/daemon.lock`. Only one window wins.
+4. The winner unlinks a stale socket and **spawns `prh` detached** — its own
+   process group, `unref()`'d, not a child that dies with the extension host.
+5. Losers wait briefly for the socket to appear, then adopt it.
+
+The socket is the election token, so there is no separate registry to go
+stale. A crashed daemon leaves a socket that fails to connect, which is
+step 2.
+
+### Lifetime
+
+`prh` outlives every window deliberately. Closing the last VSCode window must
+not drop the phone's endpoint — that is the moment you are most likely to walk
+away from the desk, which is exactly when the watch matters.
+
+It exits only on an explicit **Stop daemon** command. No idle timeout: an idle
+daemon is the normal state of a harness that is waiting for you to be
+interrupted.
+
+### Windows that disagree
+
+The first window to start the daemon sets its bind address and port. Later
+windows must **not** restart it to apply their own settings — that would drop
+every other window's upstream and unpair nothing gracefully. They compare
+their settings against `/v1/health` and surface a warning instead.
+
+Changing the pairing password goes *through* the running daemon, never by
+restarting it.
+
+### Upstreams come and go
+
+An upstream is a plugin connection, and its lifetime is that connection's
+lifetime. When a window closes, its kilo server exits, its plugin's socket
+drops, and `prh` drops the upstream — no `DELETE` call to miss, no stale entry
+if VSCode is killed rather than closed.
+
+Reconnection from the same `(parent_pid, directory)` replaces the entry, which
+is what a window reload looks like.
+
+### Telling projects apart on the wrist
+
+With every window feeding one endpoint, "may I run `rm -rf build/`?" is a
+dangerous question without a label. Envelopes therefore carry a `project`
+string derived from the plugin's `directory`, and the watch shows it in the
+header. Approving the right command in the wrong repository is precisely the
+mistake this design must not enable.
+
+Multiple *machines* remain unsolved — one remote host, one `prh`, one pairing.
+Pairing the companion with several servers is future work.
+
 ## Why the Android companion carries the network
 
 PebbleKit JS is started and killed with the watchapp — there is no background
