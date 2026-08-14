@@ -24,22 +24,28 @@ class PebbleBridge(private val context: Context) {
         /** Must match watchapp/package.json. */
         val WATCHAPP_UUID: UUID = UUID.fromString("630aaa1e-ad28-4694-950d-a25105a7390b")
 
-        // Message keys are indices assigned by the Pebble build from the
-        // messageKeys array in watchapp/package.json.
-        // TODO: read the generated mapping rather than hardcoding indices —
-        // reordering that array silently breaks the wire otherwise.
-        const val KEY_EVENT_ID = 0
-        const val KEY_EVENT_TYPE = 1
-        const val KEY_PROJECT = 2
-        const val KEY_SESSION = 3
-        const val KEY_TITLE = 4
-        const val KEY_BODY = 5
-        const val KEY_CHOICES = 6
-        const val KEY_STATUS = 7
-        const val KEY_REPLY_ID = 8
-        const val KEY_REPLY_ACTION = 9
-        const val KEY_REPLY_CHOICE = 10
-        const val KEY_REPLY_TEXT = 11
+        // Message keys are allocated by the Pebble build from the messageKeys
+        // array in watchapp/package.json, starting at 10000 — NOT at 0.
+        // Observed on the wire: a STATUS push arrived as key=10007, matching
+        // watchapp/build/js/message_keys.json.
+        //
+        // Getting this wrong fails silently: the watchapp finds none of the
+        // keys it is looking for and simply ignores the message.
+        //
+        // TODO: generate these from message_keys.json at build time.
+        // Reordering the array in package.json renumbers everything.
+        const val KEY_EVENT_ID = 10000
+        const val KEY_EVENT_TYPE = 10001
+        const val KEY_PROJECT = 10002
+        const val KEY_SESSION = 10003
+        const val KEY_TITLE = 10004
+        const val KEY_BODY = 10005
+        const val KEY_CHOICES = 10006
+        const val KEY_STATUS = 10007
+        const val KEY_REPLY_ID = 10008
+        const val KEY_REPLY_ACTION = 10009
+        const val KEY_REPLY_CHOICE = 10010
+        const val KEY_REPLY_TEXT = 10011
 
         const val CHOICE_SEPARATOR = '\u001F'
     }

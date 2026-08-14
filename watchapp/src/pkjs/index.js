@@ -14,9 +14,16 @@ var STATUS_CONNECTED = 1;
 Pebble.addEventListener('ready', function () {
   console.log('prh: pkjs ready');
 
+  // Deliberately sends nothing.
+  //
+  // The Core app starts this runtime automatically whenever the watchapp
+  // launches — including when the companion launches it — so anything sent
+  // here races the companion. Pushing STATUS_DISCONNECTED on ready told the
+  // watch it was offline at the exact moment the companion had just woken it.
+  //
   // TODO (fallback path only): read the server address and device token from
-  // localStorage, then start the long-poll loop against GET /v1/poll.
-  Pebble.sendAppMessage({ STATUS: STATUS_DISCONNECTED });
+  // localStorage, then start the long-poll loop against GET /v1/poll, and
+  // only then start reporting STATUS.
 });
 
 Pebble.addEventListener('appmessage', function (e) {

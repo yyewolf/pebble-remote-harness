@@ -69,11 +69,42 @@ Use classic, watch PebbleKit 2. If classic is eventually removed, confirm
 PebbleKit 2 can launch a watchapp before assuming the migration is
 mechanical — if it cannot, the fallbacks in `notifications.md` apply.
 
-### Still to prove end to end
+### Proven end to end
 
-Reading the surface is not the same as exercising it. The remaining test is to
-sideload `watchapp.pbw`, fire `com.getpebble.action.app.START` with our UUID,
-and watch the app open on the wrist.
+Sideloaded `watchapp.pbw`, closed the app, and broadcast `app.START` from
+`adb`. The watchapp opened on the wrist. Logcat, trimmed:
+
+```
+PebbleKitClassicStartListeners: Got intent: com.getpebble.action.app.START
+PebbleKitClassicStartListeners: Got app start: 630aaa1e-…
+PebbleProtocol: sending  AppRunStateStart(uuid=630aaa1e-…)
+PebbleProtocolRunner: inbound AppRunStateStop (uuid=69730192-…)   ← old app closed
+PebbleProtocolRunner: inbound AppRunStateStart(uuid=630aaa1e-…)   ← watch confirms
+PebbleAppDelegate: PKJS session 0: 630aaa1e-… (Remote Harness) is ready: false
+PrivatePKJSInterface: [PKJS:LOG] "prh: pkjs ready"
+PebbleProtocol: sending AppMessagePush(uuid=630aaa1e-…, key=10007, data=[0,0,0,0])
+```
+
+The wake mechanism works, and the watch itself confirms the launch rather
+than us inferring it from the phone side.
+
+Three things this taught us that static analysis had not:
+
+- **A plain String UUID extra is accepted.** Classic PebbleKit passes a
+  serialized `java.util.UUID`; this reimplementation parses a string, which is
+  why `adb shell am broadcast --es uuid …` worked at all. Do not rely on the
+  leniency in the companion — use the real PebbleKit call — but it makes
+  shell-driven testing possible.
+- **Message keys start at 10000, not 0.** That `key=10007` is `STATUS`, the
+  eighth entry in `messageKeys`. The companion's constants were 0-based and
+  would have failed *silently*: the watchapp finds none of the keys it wants
+  and ignores the message. Authoritative mapping is
+  `watchapp/build/js/message_keys.json`.
+- **PKJS starts automatically with the watchapp**, even when the companion did
+  the launching. So the pkjs stub and the companion are both live and both can
+  send AppMessages. Ours was pushing `STATUS_DISCONNECTED` on ready — telling
+  the watch it was offline at the moment the companion had just woken it. The
+  fallback pkjs is now inert by default.
 
 ## Responsibilities
 

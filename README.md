@@ -99,9 +99,11 @@ Resolved along the way, each by probing rather than assuming:
   different field names throughout.
 - **Reply bodies.** `{"reply": "once"|"always"|"reject"}`.
 
-Still to prove: sideload `watchapp.pbw`, fire `app.START` with our UUID, and
-confirm the app opens on the wrist. Reading an API surface is not the same as
-exercising it.
+**The wake mechanism is proven on hardware.** With the watchapp closed, an
+`app.START` broadcast opened it on the wrist, and the watch confirmed the
+launch back over the protocol. That test also caught a silent-failure bug —
+AppMessage keys start at 10000, not 0, so the companion's constants would have
+produced dictionaries the watchapp ignores without complaint.
 
 Also worth knowing: Kilo's API is undocumented and unstable, so a Kilo upgrade
 can break the integration. `api/internal/kilo` is deliberately the only place
