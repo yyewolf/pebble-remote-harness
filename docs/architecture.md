@@ -112,6 +112,26 @@ Tailscale or similar otherwise.
 
 ### `watchapp/` — Pebble Time 2 app
 
-Target platform `emery` (200x228, 64 colors), the SDK codename Core Devices
-revived for the PT2. Pure UI: prompt card, choice list, dictation session.
-Receives AppMessages from the companion, sends replies back the same way.
+Pure UI: prompt card, choice list, dictation session. Receives AppMessages
+from the companion, sends replies back the same way.
+
+Target platform is `emery`, confirmed against SDK 4.33.1's
+`pebble_sdk_platform.py` rather than assumed:
+
+| Capability | Value |
+|---|---|
+| Display | 200x228, `PBL_COLOR`, `PBL_RECT` |
+| Input | buttons, `PBL_TOUCH` |
+| Audio | `PBL_MICROPHONE`, `PBL_SPEAKER` |
+| Other | `PBL_RGB_BACKLIGHT`, `PBL_COMPASS`, `PBL_HEALTH`, `PBL_SMARTSTRAP` |
+| Budget | 128K app binary, 128K app RAM, 256K resources |
+
+`PBL_MICROPHONE` is what makes dictation possible; the built ELF links five
+dictation symbols, so the capability is live and not merely declared.
+
+`PBL_TOUCH` is unexploited and worth revisiting — a touch choice list beats
+paging through options with UP/DOWN.
+
+Do not confuse `emery` with `gabbro`, the other modern platform in the same
+SDK: gabbro is 260x260 and `PBL_ROUND`, so a layout tuned for one is wrong on
+the other.

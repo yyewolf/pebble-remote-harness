@@ -50,7 +50,10 @@ Full detail in [docs/architecture.md](docs/architecture.md).
 | `api/` | yes — `go build ./...`, binary runs | types, config, routing, `/v1/health` |
 | `extension/` | not tried — needs `npm install` | manifest, commands, status bar shape |
 | `companion/` | no — no JDK or Android SDK present | data models only |
-| `watchapp/` | no — no Pebble SDK present | UI skeleton, button map, AppMessage decode |
+| `watchapp/` | yes — `pebble build` produces `watchapp.pbw` | UI skeleton, button map, AppMessage decode |
+
+The watchapp compiles against Pebble SDK 4.33.1 for `emery` and uses 2810
+bytes of RAM, leaving ~125K of heap — the memory budget is a non-issue here.
 
 ## Before writing more code
 
