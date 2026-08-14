@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -72,5 +73,40 @@ func TestVerifyPasswordUnpaired(t *testing.T) {
 	r := NewRegistry("")
 	if err := r.VerifyPassword("anything"); err != ErrBadPassword {
 		t.Fatalf("unpaired: err = %v, want ErrBadPassword", err)
+	}
+}
+
+func TestHashAndVerifyArgon2id(t *testing.T) {
+	hash, err := HashPassword("correct horse battery")
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if !strings.HasPrefix(hash, "$argon2id$") {
+		t.Fatalf("hash prefix = %q, want $argon2id$", hash[:10])
+	}
+
+	r := NewRegistry(hash)
+	if err := r.VerifyPassword("correct horse battery"); err != nil {
+		t.Fatalf("correct: %v", err)
+	}
+	if err := r.VerifyPassword("wrong"); err != ErrBadPassword {
+		t.Fatalf("wrong: err = %v, want ErrBadPassword", err)
+	}
+}
+
+func TestHashPasswordUniqueSalt(t *testing.T) {
+	h1, _ := HashPassword("same")
+	h2, _ := HashPassword("same")
+	if h1 == h2 {
+		t.Fatal("two hashes of the same password are identical; salt is not random")
+	}
+
+	r := NewRegistry(h1)
+	if err := r.VerifyPassword("same"); err != nil {
+		t.Fatalf("verify h1: %v", err)
+	}
+	r2 := NewRegistry(h2)
+	if err := r2.VerifyPassword("same"); err != nil {
+		t.Fatalf("verify h2: %v", err)
 	}
 }
