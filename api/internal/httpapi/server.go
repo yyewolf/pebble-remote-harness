@@ -119,10 +119,36 @@ func (s *Server) handlePluginEvents(w http.ResponseWriter, r *http.Request) {
 
 // handlePluginDecisions is the downlink long-poll the plugin holds open.
 //
-// TODO: implement. Only hand an upstream the decisions addressed to it —
-// one window's plugin must never be able to apply another window's approval.
+// Only the owning upstream's decisions are returned — one window's plugin
+// must never be able to apply another window's approval.
 func (s *Server) handlePluginDecisions(w http.ResponseWriter, r *http.Request) {
-	writeErr(w, http.StatusNotImplemented, "plugin decisions not implemented")
+	upstreamID := r.URL.Query().Get("upstream_id")
+	if upstreamID == "" || !s.hub.UpstreamExists(upstreamID) {
+		writeErr(w, http.StatusBadRequest, "unknown upstream_id")
+		return
+	}
+
+	cursor, _ := strconv.ParseUint(r.URL.Query().Get("cursor"), 10, 64)
+	waitSec := s.cfg.MaxPollWaitSec
+	if q := r.URL.Query().Get("wait"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n >= 0 && n < waitSec {
+			waitSec = n
+		}
+	}
+
+	resp, err := s.hub.PollDecisions(r.Context(), upstreamID, cursor, time.Duration(waitSec)*time.Second)
+	if err != nil {
+		switch {
+		case errors.Is(err, hub.ErrAlreadyAnswered):
+			writeErr(w, http.StatusGone, "upstream gone")
+		case errors.Is(err, context.Canceled):
+			writeJSON(w, http.StatusOK, protocol.DecisionsResponse{Cursor: 0, Decisions: nil})
+		default:
+			writeErr(w, http.StatusInternalServerError, "poll error")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handlePluginAck records what the plugin actually applied, which is what
@@ -132,7 +158,8 @@ func (s *Server) handlePluginAck(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	writeErr(w, http.StatusNotImplemented, "plugin ack not implemented")
+	s.hub.AckDecision(req.UpstreamID, req.ID, req.Status)
+	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
 
 // handleHealth is unauthenticated and must never leak secrets.
@@ -223,14 +250,31 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request, dev *auth.De
 
 // handleReply answers a perm or ques envelope.
 //
-// TODO: implement. Map an already-answered or expired envelope to 409 —
-// the companion retries on network failure and must not double-approve.
+// An already-answered or expired envelope maps to 409 — the companion
+// retries on network failure and must not double-approve.
 func (s *Server) handleReply(w http.ResponseWriter, r *http.Request, dev *auth.Device) {
 	var req protocol.ReplyRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	writeErr(w, http.StatusNotImplemented, "reply not implemented")
+	if req.EventID == "" {
+		writeErr(w, http.StatusBadRequest, "missing event_id")
+		return
+	}
+	if req.Action == "" {
+		writeErr(w, http.StatusBadRequest, "missing action")
+		return
+	}
+
+	if err := s.hub.Reply(req); err != nil {
+		if errors.Is(err, hub.ErrAlreadyAnswered) {
+			writeErr(w, http.StatusConflict, "already answered or expired")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "reply error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // handlePrompt forwards dictated text as new work.

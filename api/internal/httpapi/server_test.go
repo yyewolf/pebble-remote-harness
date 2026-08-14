@@ -307,3 +307,156 @@ func TestHandlePollContextCancel(t *testing.T) {
 		t.Errorf("events = %d, want 0", len(resp.Events))
 	}
 }
+
+// --- M2: reply → decisions → ack ---
+
+func TestReplyAndPluginDecisions(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+
+	// Register upstream and send a permission event.
+	w := doPluginJSON(t, srv, "POST", "/plugin/v1/hello", protocol.PluginHello{
+		Protocol:  protocol.Version,
+		Directory: "/home/me/infra",
+	})
+	var helloResp protocol.PluginHelloResponse
+	json.Unmarshal(w.Body.Bytes(), &helloResp)
+
+	doPluginJSON(t, srv, "POST", "/plugin/v1/events", protocol.PluginEvents{
+		UpstreamID: helloResp.UpstreamID,
+		Events: []protocol.PluginEvent{{
+			Kind:      "permission",
+			RequestID: "per_1",
+			SessionID: "ses_1",
+			Action:    "bash",
+			Resources: []string{"rm -rf build/"},
+		}},
+	})
+
+	// Register a device and poll to get the event ID.
+	_, token, _ := srv.devices.Register("dev", "android")
+	w = doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, token)
+	var pollResp protocol.PollResponse
+	json.Unmarshal(w.Body.Bytes(), &pollResp)
+	if len(pollResp.Events) != 1 {
+		t.Fatalf("poll events = %d, want 1", len(pollResp.Events))
+	}
+	envID := pollResp.Events[0].ID
+
+	// Reply: approve once.
+	w = doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
+		EventID: envID,
+		Action:  protocol.ActionOnce,
+	}, token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reply status = %d, body %s", w.Code, w.Body.String())
+	}
+
+	// Plugin long-polls decisions.
+	w = doPluginJSON(t, srv, "GET", "/plugin/v1/decisions?upstream_id="+helloResp.UpstreamID+"&cursor=0&wait=0", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("decisions status = %d, body %s", w.Code, w.Body.String())
+	}
+	var decResp protocol.DecisionsResponse
+	json.Unmarshal(w.Body.Bytes(), &decResp)
+	if len(decResp.Decisions) != 1 {
+		t.Fatalf("decisions = %d, want 1", len(decResp.Decisions))
+	}
+	dec := decResp.Decisions[0]
+	if dec.RequestID != "per_1" {
+		t.Errorf("request_id = %q", dec.RequestID)
+	}
+	if dec.Action != protocol.ActionOnce {
+		t.Errorf("action = %q, want once", dec.Action)
+	}
+	if dec.Nonce == "" {
+		t.Error("empty nonce")
+	}
+
+	// Ack.
+	w = doPluginJSON(t, srv, "POST", "/plugin/v1/ack", protocol.DecisionAck{
+		UpstreamID: helloResp.UpstreamID,
+		ID:         dec.ID,
+		Status:     "applied",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("ack status = %d", w.Code)
+	}
+}
+
+func TestReplyAlreadyAnswered(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+
+	w := doPluginJSON(t, srv, "POST", "/plugin/v1/hello", protocol.PluginHello{
+		Protocol:  protocol.Version,
+		Directory: "/home/me/infra",
+	})
+	var helloResp protocol.PluginHelloResponse
+	json.Unmarshal(w.Body.Bytes(), &helloResp)
+
+	doPluginJSON(t, srv, "POST", "/plugin/v1/events", protocol.PluginEvents{
+		UpstreamID: helloResp.UpstreamID,
+		Events: []protocol.PluginEvent{{
+			Kind:      "permission",
+			RequestID: "per_1",
+			SessionID: "ses_1",
+			Action:    "bash",
+			Resources: []string{"ls"},
+		}},
+	})
+
+	_, token, _ := srv.devices.Register("dev", "android")
+	w = doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, token)
+	var pollResp protocol.PollResponse
+	json.Unmarshal(w.Body.Bytes(), &pollResp)
+	envID := pollResp.Events[0].ID
+
+	// First reply succeeds.
+	w = doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
+		EventID: envID,
+		Action:  protocol.ActionOnce,
+	}, token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("first reply = %d", w.Code)
+	}
+
+	// Second reply must be 409.
+	w = doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
+		EventID: envID,
+		Action:  protocol.ActionAlways,
+	}, token)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("second reply = %d, want 409", w.Code)
+	}
+}
+
+func TestReplyUnknownEvent(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	_, token, _ := srv.devices.Register("dev", "android")
+
+	w := doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
+		EventID: "evt_bogus",
+		Action:  protocol.ActionOnce,
+	}, token)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", w.Code)
+	}
+}
+
+func TestReplyNoToken(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	w := doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
+		EventID: "evt_1",
+		Action:  protocol.ActionOnce,
+	}, "")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestPluginDecisionsBadUpstream(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	w := doPluginJSON(t, srv, "GET", "/plugin/v1/decisions?upstream_id=up_bogus&cursor=0&wait=0", nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
