@@ -24,6 +24,8 @@ Trust the first column; re-check the second before relying on it.
 | `permission.ask` hook does not fire | **probed** |
 | Plugin can hold a background loop | **probed** |
 | Plugin fails open with no daemon | **probed** |
+| Global install path + `hello` handshake | **tested end to end** |
+| Extension's detect/install of the plugin | **known broken** — see `plugin.md` |
 | Socket election + stale reclaim | **tested** |
 | Plugin routes absent from TCP | **tested** |
 | `app.START` wakes a closed watchapp | **tested on hardware** |
@@ -156,3 +158,9 @@ adb shell am broadcast -a com.getpebble.action.app.START \
   still appears inside its dex.
 - PKJS starts automatically with the watchapp, so the fallback `pkjs` and the
   companion can both send messages. Keep pkjs inert.
+- Plugin config goes in `~/.config/kilo/opencode.json`. The `plugin` array in
+  `kilo.jsonc` is ignored even though the rest of that file works.
+- Kilo runs on **Bun**, whose `http.Agent` ignores `socketPath` and dials
+  localhost:80 instead. Set `socketPath` per request.
+- Nothing logs a plugin load. Watch `upstreams` in `GET /v1/health`; a plugin
+  that fails open is indistinguishable from one that was never loaded.
