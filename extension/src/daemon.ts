@@ -45,6 +45,7 @@ export class Daemon implements vscode.Disposable {
    */
   async start(): Promise<void> {
     this.setState('starting');
+    this.output.appendLine('start: not implemented');
     this.setState('failed');
     throw new Error('Daemon.start not implemented');
   }
