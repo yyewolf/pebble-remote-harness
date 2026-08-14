@@ -1,7 +1,6 @@
 package dev.yyewolf.prh
 
 import android.content.Context
-import android.os.Bundle
 import com.getpebble.android.kit.PebbleKit
 import com.getpebble.android.kit.util.PebbleDictionary
 import java.util.UUID
@@ -96,14 +95,18 @@ class PebbleBridge(private val context: Context) {
      * state.
      */
     fun onReply(handler: (Reply) -> Unit) {
-        PebbleKit.registerReceivedDataHandler(context) { _, dict ->
-            val id = dict.getString(KEY_REPLY_ID) ?: return@registerReceivedDataHandler
-            val actionWire = dict.getInteger(KEY_REPLY_ACTION)?.toInt() ?: return@registerReceivedDataHandler
-            val action = ReplyAction.fromWire(actionWire) ?: return@registerReceivedDataHandler
+        PebbleKit.registerReceivedDataHandler(context, object : PebbleKit.PebbleDataReceiver(WATCHAPP_UUID) {
+            override fun receiveData(context: Context, transactionId: Int, dict: PebbleDictionary) {
+                val id = dict.getString(KEY_REPLY_ID) ?: return
+                val actionWire = dict.getInteger(KEY_REPLY_ACTION)?.toInt() ?: return
+                val action = ReplyAction.fromWire(actionWire) ?: return
 
-            val choice = dict.getInteger(KEY_REPLY_CHOICE)?.toInt() ?: 0
-            val text = dict.getString(KEY_REPLY_TEXT) ?: ""
-            handler(Reply(eventId = id, action = action, choice = choice, text = text))
-        }
+                val choice = dict.getInteger(KEY_REPLY_CHOICE)?.toInt() ?: 0
+                val text = dict.getString(KEY_REPLY_TEXT) ?: ""
+                handler(Reply(eventId = id, action = action, choice = choice, text = text))
+
+                PebbleKit.sendAckToPebble(context, transactionId)
+            }
+        })
     }
 }

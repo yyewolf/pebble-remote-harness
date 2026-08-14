@@ -130,10 +130,16 @@ class PrhClient(
 
     /** Unauthenticated liveness probe, used by the settings screen. */
     suspend fun health(): Boolean = withContext(Dispatchers.IO) {
+        var conn: HttpURLConnection? = null
         try {
-            openConn("GET", "/v1/health").use { it.responseCode == 200 }
+            conn = openConn("GET", "/v1/health")
+            conn.readTimeout = 5_000
+            conn.connectTimeout = 5_000
+            conn.responseCode == 200
         } catch (e: IOException) {
             false
+        } finally {
+            conn?.disconnect()
         }
     }
 

@@ -79,6 +79,12 @@ static DictationSession *s_dictation;
 static MenuLayer *s_menu_layer;
 
 // ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+
+static void render_current(void);
+
+// ---------------------------------------------------------------------------
 // Outbound
 // ---------------------------------------------------------------------------
 
@@ -198,9 +204,9 @@ static int16_t menu_get_cell_height(struct MenuLayer *menu, MenuIndex *cell_inde
   return 36;
 }
 
-static void menu_selection_changed(struct MenuLayer *menu, MenuIndex *new_index,
-                                    void *context) {
-  s_current.selected = new_index->row;
+static void menu_selection_changed(struct MenuLayer *menu, MenuIndex new_index,
+                                    MenuIndex old_index, void *context) {
+  s_current.selected = new_index.row;
 }
 
 static void show_menu(bool show) {
@@ -277,7 +283,6 @@ static void parse_choices(const char *packed) {
   s_current.choice_count = 0;
   if (packed == NULL || packed[0] == '\0') return;
 
-  int i = 0;
   const char *start = packed;
   const char *p = packed;
   while (*p != '\0' && s_current.choice_count < MAX_CHOICES) {
