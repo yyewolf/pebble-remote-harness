@@ -1,12 +1,15 @@
 package dev.yyewolf.prh
 
 import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
+import android.util.Log
 import com.getpebble.android.kit.PebbleKit
 import com.getpebble.android.kit.util.PebbleDictionary
-import com.getpebble.android.kit.Constants
+import java.io.IOException
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.util.UUID
+import java.util.concurrent.Executors
 
 /**
  * The reason this app exists.
@@ -22,23 +25,20 @@ import java.util.UUID
  *
  * Use classic, not PebbleKit 2: only classic exposes app.START, and launching
  * a closed watchapp is the one capability this project cannot do without.
+ *
+ * **Inbound AppMessages**: the Core Devices app does NOT broadcast
+ * com.getpebble.action.app.RECEIVE to other apps — it routes inbound
+ * AppMessages only to PKJS. So PKJS forwards replies to a local HTTP server
+ * on the companion (see [PkjsRelayServer]), which then sends them to prh.
  */
 class PebbleBridge(private val context: Context) {
 
     companion object {
+        private const val TAG = "PebbleBridge"
+
         /** Must match watchapp/package.json. */
         val WATCHAPP_UUID: UUID = UUID.fromString("630aaa1e-ad28-4694-950d-a25105a7390b")
 
-        // Message keys are allocated by the Pebble build from the messageKeys
-        // array in watchapp/package.json, starting at 10000 — NOT at 0.
-        // Observed on the wire: a STATUS push arrived as key=10007, matching
-        // watchapp/build/js/message_keys.json.
-        //
-        // Getting this wrong fails silently: the watchapp finds none of the
-        // keys it is looking for and simply ignores the message.
-        //
-        // TODO: generate these from message_keys.json at build time.
-        // Reordering the array in package.json renumbers everything.
         const val KEY_EVENT_ID = 10000
         const val KEY_EVENT_TYPE = 10001
         const val KEY_PROJECT = 10002
@@ -53,9 +53,12 @@ class PebbleBridge(private val context: Context) {
         const val KEY_REPLY_TEXT = 10011
 
         const val CHOICE_SEPARATOR = '\u001F'
+
+        /** The local port PKJS connects to for relaying replies. */
+        const val PKJS_RELAY_PORT = 8478
     }
 
-    private var receiver: PebbleKit.PebbleDataReceiver? = null
+    private var relayServer: PkjsRelayServer? = null
 
     /** Whether a watch is currently connected. */
     fun isConnected(): Boolean =
@@ -63,9 +66,6 @@ class PebbleBridge(private val context: Context) {
 
     /**
      * Launches the watchapp.
-     *
-     * Launching is asynchronous and there is no completion callback, so the
-     * envelope send needs a delay or a readiness handshake from the watchapp.
      */
     fun wakeWatchApp() {
         PebbleKit.startAppOnPebble(context, WATCHAPP_UUID)
@@ -74,8 +74,8 @@ class PebbleBridge(private val context: Context) {
     /**
      * Pushes an envelope to the watch.
      *
-     * Keeps the dictionary under ~1 KB: the negotiated AppMessage inbox is
-     * small and an oversized dict is rejected outright rather than truncated.
+     * Also sets the companion URL in PKJS localStorage via a STATUS message
+     * so PKJS knows where to forward replies.
      */
     fun send(envelope: Envelope) {
         val dict = PebbleDictionary()
@@ -94,46 +94,114 @@ class PebbleBridge(private val context: Context) {
     }
 
     /**
-     * Registers the handler for replies coming back from the watch.
-     *
-     * Registers the BroadcastReceiver manually with RECEIVER_NOT_EXPORTED on
-     * API 34+, because PebbleKit's own registerReceivedDataHandler does not
-     * pass the flag and crashes on Android 14+.
+     * Starts the PKJS relay server. PKJS connects here to forward watch
+     * replies, since the Core Devices app doesn't broadcast RECEIVE.
      */
-    fun onReply(handler: (Reply) -> Unit) {
-        if (receiver != null) return
+    fun startRelay(onReply: (Reply) -> Unit) {
+        if (relayServer != null) return
+        relayServer = PkjsRelayServer(PKJS_RELAY_PORT, onReply)
+        relayServer?.start()
+        Log.i(TAG, "PKJS relay server listening on port $PKJS_RELAY_PORT")
+    }
 
-        receiver = object : PebbleKit.PebbleDataReceiver(WATCHAPP_UUID) {
-            override fun receiveData(ctx: Context, transactionId: Int, dict: PebbleDictionary) {
-                val id = dict.getString(KEY_REPLY_ID) ?: return
-                val actionWire = dict.getInteger(KEY_REPLY_ACTION)?.toInt() ?: return
-                val action = ReplyAction.fromWire(actionWire) ?: return
+    /** Stops the relay server and unregisters any receivers. */
+    fun shutdown() {
+        relayServer?.stop()
+        relayServer = null
+    }
+}
 
-                val choice = dict.getInteger(KEY_REPLY_CHOICE)?.toInt() ?: 0
-                val text = dict.getString(KEY_REPLY_TEXT) ?: ""
-                handler(Reply(eventId = id, action = action, choice = choice, text = text))
+/**
+ * Minimal HTTP server that receives reply forwards from PKJS.
+ *
+ * PKJS runs inside the Core Devices app and cannot use classic PebbleKit
+ * broadcasts to deliver watch replies. Instead it POSTs to this local server.
+ */
+class PkjsRelayServer(
+    private val port: Int,
+    private val onReply: (Reply) -> Unit,
+) {
+    private val executor = Executors.newSingleThreadExecutor()
+    private var server: ServerSocket? = null
+    private var running = false
 
-                PebbleKit.sendAckToPebble(ctx, transactionId)
+    fun start() {
+        running = true
+        executor.execute {
+            try {
+                server = ServerSocket()
+                server!!.bind(InetSocketAddress("127.0.0.1", port))
+                Log.i("PkjsRelay", "listening on 127.0.0.1:$port")
+                while (running) {
+                    val client = try { server!!.accept() } catch (e: IOException) { break }
+                    handle(client)
+                }
+            } catch (e: Exception) {
+                Log.e("PkjsRelay", "server error", e)
             }
-        }
-
-        val filter = IntentFilter()
-        filter.addAction("com.getpebble.android.app.RECEIVE")
-        filter.addDataScheme("pebble")
-        filter.addDataAuthority(WATCHAPP_UUID.toString(), null)
-
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            context.registerReceiver(receiver, filter)
         }
     }
 
-    /** Unregisters the reply receiver. Call when the service is destroyed. */
-    fun shutdown() {
-        receiver?.let {
-            try { context.unregisterReceiver(it) } catch (e: Exception) { /* already unregistered */ }
-            receiver = null
+    fun stop() {
+        running = false
+        try { server?.close() } catch (e: Exception) {}
+        executor.shutdownNow()
+    }
+
+    private fun handle(client: Socket) {
+        try {
+            val input = client.getInputStream().bufferedReader()
+            val output = client.getOutputStream()
+
+            val requestLine = input.readLine() ?: return
+            val headers = mutableMapOf<String, String>()
+            var line: String?
+            while (input.readLine().also { line = it } != null && line!!.isNotEmpty()) {
+                val parts = line!!.split(": ", limit = 2)
+                if (parts.size == 2) headers[parts[0].lowercase()] = parts[1]
+            }
+
+            var body = ""
+            val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
+            if (contentLength > 0) {
+                val buf = CharArray(contentLength)
+                input.read(buf, 0, contentLength)
+                body = String(buf)
+            }
+
+            if (requestLine.startsWith("POST")) {
+                val reply = parseReply(body)
+                if (reply != null) {
+                    onReply(reply)
+                    output.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".toByteArray())
+                } else {
+                    output.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".toByteArray())
+                }
+            } else if (requestLine.startsWith("GET")) {
+                output.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".toByteArray())
+            } else {
+                output.write("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n".toByteArray())
+            }
+            output.flush()
+        } catch (e: Exception) {
+            Log.e("PkjsRelay", "handle error", e)
+        } finally {
+            try { client.close() } catch (e: Exception) {}
+        }
+    }
+
+    private fun parseReply(body: String): Reply? {
+        try {
+            val json = org.json.JSONObject(body)
+            val eventId = json.getString("event_id")
+            val actionSlug = json.getString("action")
+            val action = ReplyAction.entries.firstOrNull { it.slug == actionSlug } ?: return null
+            val choice = json.optInt("choice", 0)
+            val text = json.optString("text", "")
+            return Reply(eventId, action, choice, text)
+        } catch (e: Exception) {
+            Log.e("PkjsRelay", "parse error: $body", e)
+            return null
         }
     }
 }

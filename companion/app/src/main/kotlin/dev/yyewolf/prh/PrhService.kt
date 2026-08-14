@@ -110,11 +110,17 @@ class PrhService : Service() {
     private fun startPollLoop() {
         if (pollJob?.isActive == true) return
 
-        val baseUrl = PrhPrefs.getBaseUrl(this) ?: return
-        val token = PrhPrefs.getToken(this) ?: return
+        val baseUrl = PrhPrefs.getBaseUrl(this)
+        val token = PrhPrefs.getToken(this)
+        if (baseUrl == null || token == null) {
+            Log.w(TAG, "not paired, skipping poll loop")
+            return
+        }
+        Log.i(TAG, "starting poll loop against $baseUrl")
         client = PrhClient(baseUrl, token)
 
-        bridge.onReply { reply ->
+        bridge.startRelay { reply ->
+            Log.i(TAG, "reply from watch via PKJS: ${reply.eventId} ${reply.action}")
             scope.launch { forward(reply) }
         }
 
@@ -124,6 +130,7 @@ class PrhService : Service() {
     private suspend fun pollLoop() {
         var cursor = PrhPrefs.getCursor(this)
         var backoff = 1000L
+        Log.i(TAG, "poll loop started, cursor=$cursor")
 
         while (true) {
             try {
@@ -132,7 +139,12 @@ class PrhService : Service() {
                 PrhPrefs.setCursor(this, cursor)
                 backoff = 1000L
 
+                if (events.isNotEmpty()) {
+                    Log.i(TAG, "received ${events.size} events at cursor=$cursor")
+                }
+
                 for (env in events) {
+                    Log.i(TAG, "delivering: type=${env.type} project=${env.project} title=${env.title}")
                     deliver(env)
                 }
             } catch (e: PrhClient.CursorTooOld) {
@@ -162,16 +174,21 @@ class PrhService : Service() {
      * for it.
      */
     private fun deliver(envelope: Envelope) {
+        val connected = bridge.isConnected()
+        Log.i(TAG, "deliver: connected=$connected type=${envelope.type}")
+
         if (envelope.type.needsReply) {
-            if (bridge.isConnected()) {
+            if (connected) {
+                Log.i(TAG, "waking watch and sending envelope")
                 bridge.wakeWatchApp()
                 Thread.sleep(500)
                 bridge.send(envelope)
             } else {
+                Log.w(TAG, "watch unreachable, posting notification")
                 postAlert(envelope)
             }
         } else {
-            if (bridge.isConnected()) {
+            if (connected) {
                 bridge.send(envelope)
             } else if (envelope.type == EventType.IDLE || envelope.type == EventType.ERR) {
                 postAlert(envelope)
