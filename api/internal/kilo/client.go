@@ -120,11 +120,29 @@ func (c *Client) Ping(ctx context.Context) error {
 	return ErrNotImplemented
 }
 
-// Discover locates the kilo serve instance that Kilo Code spawned.
+// Instance is one discovered kilo serve process.
+type Instance struct {
+	PID       int
+	ParentPID int    // KILO_PARENT_PID: the VSCode extension host that spawned it
+	BaseURL   string // http://127.0.0.1:<port from the listening socket>
+	Password  string // KILO_SERVER_PASSWORD, per-instance
+}
+
+// Discover enumerates running kilo serve processes owned by this user.
 //
-// TODO: unresolved — see the open question in docs/kilo-integration.md.
-// Candidates: read Kilo's state directory, use --mdns service discovery, or
-// have prh spawn a dedicated instance it controls.
-func Discover(ctx context.Context, timeout time.Duration) ([]string, error) {
+// Kilo Code spawns one server per VSCode window with `--port 0` and a fresh
+// password, so both rotate on every reload. See docs/kilo-integration.md.
+//
+// TODO: implement.
+//   - scan /proc/*/cmdline for "bin/kilo serve"
+//   - read /proc/<pid>/environ for KILO_SERVER_PASSWORD and KILO_PARENT_PID
+//   - resolve the port from the process's listening socket, since --port 0
+//     means it is absent from the command line
+//
+// Prefer the extension-side handoff: the extension matches ParentPID against
+// its own process.pid and registers the upstream, which is unambiguous and
+// keeps this Linux-only code off the daemon's critical path. This function is
+// the fallback for a standalone prh.
+func Discover(ctx context.Context, timeout time.Duration) ([]Instance, error) {
 	return nil, ErrNotImplemented
 }

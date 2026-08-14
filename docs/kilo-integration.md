@@ -80,12 +80,67 @@ GET  /permission                                         pending permissions
 
 `prompt_async` is what dictation feeds into.
 
+## Discovery
+
+Kilo Code spawns **one server per VSCode window**, each with its own random
+port and its own password, so discovery is not optional.
+
+The spawn looks like this — note `--port 0`:
+
+```
+~/.vscode-server/extensions/kilocode.kilo-code-7.4.22-linux-x64/bin/kilo serve --port 0
+```
+
+Credentials are passed in the environment, and `/proc/<pid>/environ` is
+readable by the same UID:
+
+```
+KILO_SERVER_PASSWORD=<64 chars>   per-instance; HTTP Basic as kilo:<password>
+KILO_PARENT_PID=<pid>             the VSCode extension host that spawned it
+KILO_CLIENT=vscode
+```
+
+The port is not in the command line — take it from the process's listening
+socket (`/proc/<pid>/fd` socket inodes against `/proc/net/tcp`).
+
+Verified end to end against a live instance: environ password → `200` on
+`/global/health` → a real session list from `/session`.
+
+### Correlating a server to a window
+
+`KILO_PARENT_PID` is the whole trick. Our extension runs inside the same
+window as Kilo Code, so it compares `KILO_PARENT_PID` against its own
+`process.pid` and finds *its* server with no ambiguity. It then registers
+that upstream with `prh`. N windows produce N registrations; `prh` never has
+to guess which server owns which project.
+
+This also keeps the platform-specific part in one place: only the extension
+reads `/proc`, so a macOS port changes one file rather than the daemon.
+
+### Consequences
+
+- **Credentials rotate.** A VSCode reload means a new port *and* a new
+  password. Treat 401 and connection-refused as "re-discover", not "fail".
+- **Upstreams are dynamic.** `prh` cannot take its upstream list from static
+  config; it needs a loopback-only admin endpoint for registration.
+- **`/proc` is Linux and same-UID.** Blocked under `hidepid=2` mounts.
+
+### Do not trust daemon.json
+
+`~/.local/state/kilo/daemon.json` (mode 0600) looks like the answer:
+
+```jsonc
+{ "pid": …, "hostname": "127.0.0.1", "port": 4097,
+  "url": "http://127.0.0.1:4097", "username": "kilo",
+  "password": "…", "token": "<base64 of kilo:password>", … }
+```
+
+It is **single-slot** — one daemon, not a per-window registry — and it goes
+stale: when observed it named a dead PID and a port nothing was listening on.
+Useful as a fallback hint, wrong as a source of truth.
+
 ## Open questions
 
-- **Discovery.** How does the extension learn the port of the `kilo serve`
-  instance Kilo Code itself spawned? Options: read Kilo's own config/state
-  dir, use `--mdns` service discovery, or have `prh` spawn its own dedicated
-  instance. Unresolved.
 - **Reply body shapes.** The exact request bodies for the reply endpoints are
   in `/doc` but have not been transcribed here. Pull them from the live spec
   before implementing `kilo/client.go`.
