@@ -49,7 +49,17 @@ func run(args []string) error {
 	configPath := fs.String("config", defaultConfigPath(), "path to config.json")
 	listen := fs.String("listen", "", "override the bind address")
 	showVersion := fs.Bool("version", false, "print version and exit")
-	if err := fs.Parse(args); err != nil {
+
+	// "prh serve" and "prh" both run the daemon; the subcommand is
+	// optional and exists so docs and Makefiles read naturally. Unknown
+	// subcommands are not rejected — flag.Parse stops at the first
+	// non-flag, so we strip a leading "serve" and parse the rest.
+	rest := args
+	if len(rest) > 0 && rest[0] == "serve" {
+		rest = rest[1:]
+	}
+
+	if err := fs.Parse(rest); err != nil {
 		return err
 	}
 
