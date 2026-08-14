@@ -104,6 +104,27 @@ Dictation that starts new work rather than answering a prompt. Forwards to
 Unauthenticated liveness, for the extension's status bar. Returns version,
 uptime, connected Kilo instances, registered device count. No secrets.
 
+### `POST /admin/upstream` — loopback only
+
+Kilo Code spawns one server per VSCode window, each with a random port and
+its own password, both rotating on every reload. Upstreams therefore cannot
+come from static config: each window's extension discovers its own server and
+registers it here.
+
+```jsonc
+{ "name": "infra",                       // project label, for the watch
+  "base_url": "http://127.0.0.1:4096",
+  "password": "...",                     // KILO_SERVER_PASSWORD
+  "parent_pid": 2025346 }                // extension host, the identity key
+```
+
+Re-registering the same `parent_pid` replaces the entry, which is what a
+VSCode reload produces. `DELETE /admin/upstream/{parent_pid}` drops it.
+
+**This endpoint must bind loopback only.** It accepts a Kilo password in
+plaintext and is not part of the surface the companion talks to. It is
+separate from device auth: the extension is trusted by being on the box.
+
 ## Hop 2 — companion ↔ watchapp (AppMessage)
 
 AppMessage buffers are small and inbox size is negotiated at connect. Keep

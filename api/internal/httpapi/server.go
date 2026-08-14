@@ -44,7 +44,41 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/reply", s.authed(s.handleReply))
 	mux.HandleFunc("POST /v1/prompt", s.authed(s.handlePrompt))
 
+	// Upstream registration. Kilo's port and password rotate on every VSCode
+	// reload, so each window's extension registers its own server here.
+	mux.HandleFunc("POST /admin/upstream", s.loopbackOnly(s.handleAddUpstream))
+	mux.HandleFunc("DELETE /admin/upstream/{parentPID}", s.loopbackOnly(s.handleDropUpstream))
+
 	return mux
+}
+
+// loopbackOnly rejects anything not from 127.0.0.1 or ::1.
+//
+// The admin surface carries Kilo passwords in plaintext and has no token
+// auth: the extension is trusted by virtue of running on this machine. That
+// only holds if it cannot be reached from the LAN, unlike the /v1 surface.
+//
+// TODO: implement. Parse r.RemoteAddr and compare against loopback; do not
+// trust X-Forwarded-For here.
+func (s *Server) loopbackOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, http.StatusNotImplemented, "admin surface not implemented")
+	}
+}
+
+// handleAddUpstream registers or replaces one kilo serve instance, keyed by
+// the extension host PID that spawned it.
+//
+// TODO: implement. Re-registering an existing parent_pid must replace the
+// entry and restart that upstream's SSE consumer — that is what a window
+// reload looks like from here.
+func (s *Server) handleAddUpstream(w http.ResponseWriter, r *http.Request) {
+	writeErr(w, http.StatusNotImplemented, "add upstream not implemented")
+}
+
+// handleDropUpstream removes an upstream whose window has closed.
+func (s *Server) handleDropUpstream(w http.ResponseWriter, r *http.Request) {
+	writeErr(w, http.StatusNotImplemented, "drop upstream not implemented")
 }
 
 // handleHealth is unauthenticated and must never leak secrets.
