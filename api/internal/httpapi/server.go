@@ -4,9 +4,14 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/yyewolf/pebble-remote-harness/api/internal/auth"
@@ -66,7 +71,6 @@ func (s *Server) PluginHandler() http.Handler {
 // handlePluginHello registers one kilo server, keyed by (parent_pid,
 // directory).
 //
-// TODO: implement.
 //   - reject a protocol mismatch with 409 rather than guessing
 //   - re-registering the same key replaces the entry; that is a window reload
 //   - bind the upstream to this connection so that a dropped socket, which is
@@ -77,19 +81,40 @@ func (s *Server) handlePluginHello(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	writeErr(w, http.StatusNotImplemented, "plugin hello not implemented")
+	if req.Protocol != protocol.Version {
+		writeErr(w, http.StatusConflict, "protocol mismatch: expected "+protocol.Version)
+		return
+	}
+
+	project := filepath.Base(req.Directory)
+	upstreamID := s.hub.RegisterUpstream(project, req.Directory, req.ParentPID)
+	s.log.Info("plugin upstream registered", "upstream_id", upstreamID, "directory", req.Directory)
+
+	writeJSON(w, http.StatusOK, protocol.PluginHelloResponse{
+		UpstreamID: upstreamID,
+		ServerName: s.cfg.ServerName,
+		Protocol:   protocol.Version,
+	})
 }
 
 // handlePluginEvents ingests the uplink batch and publishes envelopes.
 //
-// TODO: implement. This must never block: the plugin is inside the user's
-// agent and a slow response here is a stalled coding session.
+// This must never block: the plugin is inside the user's agent and a slow
+// response here is a stalled coding session. IngestPluginEvents is all
+// in-memory.
 func (s *Server) handlePluginEvents(w http.ResponseWriter, r *http.Request) {
 	var req protocol.PluginEvents
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	writeErr(w, http.StatusNotImplemented, "plugin events not implemented")
+	if req.UpstreamID == "" || !s.hub.UpstreamExists(req.UpstreamID) {
+		writeErr(w, http.StatusBadRequest, "unknown upstream_id")
+		return
+	}
+
+	project := s.hub.UpstreamProject(req.UpstreamID)
+	s.hub.IngestPluginEvents(req.UpstreamID, project, req.Events)
+	writeJSON(w, http.StatusOK, map[string]any{"accepted": len(req.Events)})
 }
 
 // handlePluginDecisions is the downlink long-poll the plugin holds open.
@@ -127,24 +152,73 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleRegister trades the pairing password for a device token.
 //
-// TODO: implement, and rate-limit by source IP — this is the only endpoint
-// where an attacker can guess. Repeated failures should lock the IP out.
+// TODO (M3): rate-limit by source IP — this is the only endpoint where an
+// attacker can guess. Repeated failures should lock the IP out.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req protocol.RegisterRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	writeErr(w, http.StatusNotImplemented, "register not implemented")
+	if req.Password == "" {
+		writeErr(w, http.StatusBadRequest, "missing password")
+		return
+	}
+
+	if err := s.devices.VerifyPassword(req.Password); err != nil {
+		if errors.Is(err, auth.ErrBadPassword) {
+			writeErr(w, http.StatusUnauthorized, "bad password")
+			return
+		}
+		if errors.Is(err, auth.ErrRateLimited) {
+			writeErr(w, http.StatusTooManyRequests, "too many attempts")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "auth error")
+		return
+	}
+
+	deviceID, token, err := s.devices.Register(req.DeviceName, req.Platform)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "registration failed")
+		return
+	}
+	s.log.Info("device registered", "device_id", deviceID, "name", req.DeviceName)
+
+	writeJSON(w, http.StatusOK, protocol.RegisterResponse{
+		DeviceID:   deviceID,
+		Token:      token,
+		ServerName: s.cfg.ServerName,
+	})
 }
 
 // handlePoll is the long-poll. It blocks up to wait seconds for events after
 // cursor, returning immediately if any are queued.
 //
-// TODO: implement. Parse cursor and wait, clamp wait to
-// cfg.MaxPollWaitSec, call hub.Poll, and map hub.ErrCursorTooOld to 410 so
-// the companion knows to reset rather than retry forever.
+// hub.ErrCursorTooOld maps to 410 so the companion knows to reset rather than
+// retry forever.
 func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request, dev *auth.Device) {
-	writeErr(w, http.StatusNotImplemented, "poll not implemented")
+	cursor, _ := strconv.ParseUint(r.URL.Query().Get("cursor"), 10, 64)
+	waitSec := s.cfg.MaxPollWaitSec
+	if q := r.URL.Query().Get("wait"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n >= 0 && n < waitSec {
+			waitSec = n
+		}
+	}
+
+	resp, err := s.hub.Poll(r.Context(), cursor, time.Duration(waitSec)*time.Second)
+	if err != nil {
+		switch {
+		case errors.Is(err, hub.ErrCursorTooOld):
+			writeErr(w, http.StatusGone, "cursor older than retained history")
+		case errors.Is(err, context.Canceled):
+			// Client went away or request deadline; return empty.
+			writeJSON(w, http.StatusOK, protocol.PollResponse{Cursor: s.hub.Cursor(), Events: []protocol.Envelope{}})
+		default:
+			writeErr(w, http.StatusInternalServerError, "poll error")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleReply answers a perm or ques envelope.
@@ -173,12 +247,35 @@ type authedFunc func(http.ResponseWriter, *http.Request, *auth.Device)
 
 // authed resolves the bearer token before dispatching.
 //
-// TODO: implement once auth.Registry.Authenticate exists. Until then every
-// authenticated route is unreachable, which is the safe failure direction.
+// Tokens are sent as `Authorization: Bearer prh_...`. A missing or unknown
+// token gets 401 — the safe failure direction.
 func (s *Server) authed(next authedFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeErr(w, http.StatusNotImplemented, "authentication not implemented")
+		token := bearerToken(r)
+		if token == "" {
+			writeErr(w, http.StatusUnauthorized, "missing bearer token")
+			return
+		}
+		dev, err := s.devices.Authenticate(token)
+		if err != nil {
+			writeErr(w, http.StatusUnauthorized, "invalid or revoked token")
+			return
+		}
+		next(w, r, dev)
 	}
+}
+
+// bearerToken extracts the token from an Authorization header.
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if h == "" {
+		return ""
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(h, prefix) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(prefix):])
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
