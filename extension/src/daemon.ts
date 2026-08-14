@@ -34,14 +34,23 @@ export class Daemon implements vscode.Disposable {
   }
 
   /**
-   * Starts prh if it is not already running.
+   * Ensures exactly one daemon is running for this user, then adopts it.
+   *
+   * There is one prh per machine, not per window: the phone pairs with one
+   * endpoint and sees every project. Every window runs this concurrently, so
+   * it has to be a race that only one participant can win.
    *
    * TODO: implement.
-   *  - resolve the binary: prh.binaryPath, else the bundled per-platform build
-   *  - probe /v1/health first and adopt an already-running daemon instead of
-   *    failing on a port clash
-   *  - pass --listen from prh.bindAddress and prh.port
-   *  - pipe stdout/stderr into this.output; prh logs slog text
+   *  1. connect to the plugin socket; if it answers, adopt and return
+   *  2. if it refuses but the file exists, it is crash debris
+   *  3. take an exclusive flock on `<runtime>/prh/daemon.lock`
+   *  4. the winner spawns prh **detached** — own process group, unref()'d,
+   *     stdio to a log file, never a child that dies with this window
+   *  5. losers wait for the socket to appear, then adopt
+   *
+   * Resolve the binary from prh.binaryPath, else the bundled per-platform
+   * build. If an adopted daemon reports a different `listen` than this
+   * window's settings, warn — do not restart a daemon other windows are on.
    */
   async start(): Promise<void> {
     this.setState('starting');
@@ -51,10 +60,14 @@ export class Daemon implements vscode.Disposable {
   }
 
   /**
-   * Stops prh with SIGTERM, escalating to SIGKILL after a grace period.
+   * Stops the shared daemon. Explicit user action only.
    *
-   * TODO: implement. Only kill what we spawned — an adopted daemon should
-   * outlive the window that adopted it.
+   * This affects every window and unpairs nothing gracefully, so it must be
+   * deliberate — never a side effect of closing a window. There is no idle
+   * timeout either: idle is the normal state of a harness waiting for you to
+   * be interrupted.
+   *
+   * TODO: implement with SIGTERM, escalating to SIGKILL after a grace period.
    */
   async stop(): Promise<void> {
     throw new Error('Daemon.stop not implemented');
