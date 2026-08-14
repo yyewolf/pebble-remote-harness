@@ -45,6 +45,12 @@ func main() {
 }
 
 func run(args []string) error {
+	// "prh hash-password <pw>" is a CLI utility for the extension; it does
+	// not start the daemon.
+	if len(args) > 0 && args[0] == "hash-password" {
+		return hashPassword(args[1:])
+	}
+
 	fs := flag.NewFlagSet("prh", flag.ContinueOnError)
 	configPath := fs.String("config", defaultConfigPath(), "path to config.json")
 	listen := fs.String("listen", "", "override the bind address")
@@ -194,4 +200,19 @@ func defaultConfigPath() string {
 		return "config.json"
 	}
 	return dir + "/prh/config.json"
+}
+
+// hashPassword prints an argon2id hash for the given plaintext, so the
+// extension can write it into config.json without pulling in the argon2
+// dependency itself.
+func hashPassword(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: prh hash-password <plaintext>")
+	}
+	hash, err := auth.HashPassword(args[0])
+	if err != nil {
+		return err
+	}
+	fmt.Println(hash)
+	return nil
 }
