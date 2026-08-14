@@ -1,6 +1,9 @@
 package dev.yyewolf.prh
 
 import android.content.Context
+import android.os.Bundle
+import com.getpebble.android.kit.PebbleKit
+import com.getpebble.android.kit.util.PebbleDictionary
 import java.util.UUID
 
 /**
@@ -51,38 +54,56 @@ class PebbleBridge(private val context: Context) {
     }
 
     /** Whether a watch is currently connected. */
-    fun isConnected(): Boolean = throw NotImplementedError("isConnected")
+    fun isConnected(): Boolean =
+        PebbleKit.isWatchConnected(context)
 
     /**
      * Launches the watchapp.
      *
-     * TODO: implement with PebbleKit.startAppOnPebble(context, WATCHAPP_UUID).
      * Launching is asynchronous and there is no completion callback, so the
      * envelope send needs a delay or a readiness handshake from the watchapp.
      */
     fun wakeWatchApp() {
-        throw NotImplementedError("wakeWatchApp")
+        PebbleKit.startAppOnPebble(context, WATCHAPP_UUID)
     }
 
     /**
      * Pushes an envelope to the watch.
      *
-     * TODO: implement with PebbleKit.sendDataToPebble. Keep the dictionary
-     * under ~1 KB: the negotiated AppMessage inbox is small and an oversized
-     * dict is rejected outright rather than truncated.
+     * Keeps the dictionary under ~1 KB: the negotiated AppMessage inbox is
+     * small and an oversized dict is rejected outright rather than truncated.
      */
     fun send(envelope: Envelope) {
-        throw NotImplementedError("send")
+        val dict = PebbleDictionary()
+        dict.addString(KEY_EVENT_ID, envelope.id)
+        dict.addUint8(KEY_EVENT_TYPE, envelope.type.wire.toByte())
+        dict.addString(KEY_PROJECT, envelope.project)
+        dict.addString(KEY_SESSION, envelope.session)
+        dict.addString(KEY_TITLE, envelope.title)
+        dict.addString(KEY_BODY, envelope.body)
+        if (envelope.choices.isNotEmpty()) {
+            dict.addString(KEY_CHOICES, envelope.choices.joinToString(CHOICE_SEPARATOR.toString()))
+        } else {
+            dict.addString(KEY_CHOICES, "")
+        }
+        PebbleKit.sendDataToPebble(context, WATCHAPP_UUID, dict)
     }
 
     /**
      * Registers the handler for replies coming back from the watch.
      *
-     * TODO: implement with PebbleKit.registerReceivedDataHandler, and ack
-     * every message — the watchapp waits on the ack to clear its pending
+     * Acks every message — the watchapp waits on the ack to clear its pending
      * state.
      */
     fun onReply(handler: (Reply) -> Unit) {
-        throw NotImplementedError("onReply")
+        PebbleKit.registerReceivedDataHandler(context) { _, dict ->
+            val id = dict.getString(KEY_REPLY_ID) ?: return@registerReceivedDataHandler
+            val actionWire = dict.getInteger(KEY_REPLY_ACTION)?.toInt() ?: return@registerReceivedDataHandler
+            val action = ReplyAction.fromWire(actionWire) ?: return@registerReceivedDataHandler
+
+            val choice = dict.getInteger(KEY_REPLY_CHOICE)?.toInt() ?: 0
+            val text = dict.getString(KEY_REPLY_TEXT) ?: ""
+            handler(Reply(eventId = id, action = action, choice = choice, text = text))
+        }
     }
 }

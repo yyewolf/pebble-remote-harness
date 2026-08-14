@@ -10,7 +10,11 @@ import android.content.Intent
  */
 class BootReceiver : BroadcastReceiver() {
 
-    /** TODO: implement — start PrhService, but only if a device token exists. */
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Intent.ACTION_BOOT_COMPLETED) {
+            if (PrhPrefs.isPaired(context)) {
+                PrhService.start(context)
+            }
+        }
     }
 }

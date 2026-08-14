@@ -55,8 +55,5 @@
             </intent-filter>
         </receiver>
 
-        <!-- TODO: PebbleKit's inbound AppMessage receiver goes here once the
-             compatibility probe confirms the intent surface still exists. -->
-
     </application>
 </manifest>
