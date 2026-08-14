@@ -45,15 +45,26 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
   // The user may simply not be running prh today.
   if (!existsSync(sock)) return {}
 
-  // One HTTP agent per plugin instance, pinned to the unix socket. Every
-  // request to prh reuses this; it is the only transport.
-  const agent = new http.Agent({ socketPath: sock, maxSockets: 1 })
+  // Every request to prh goes over the unix socket; it is the only transport.
+  //
+  // `socketPath` is set on each request rather than on a shared http.Agent.
+  // Kilo runs on Bun, and Bun's http.Agent ignores `socketPath` — it dials
+  // localhost:80 instead and the plugin dies with ECONNREFUSED against a
+  // socket that is demonstrably alive. Per-request `socketPath` is honoured by
+  // both runtimes. Do not "simplify" this back into an Agent.
+  const post = (path, body) => request("POST", path, body)
+  const get = (path) => request("GET", path, null)
 
-  function post(path, body) {
+  function request(method, path, body) {
     return new Promise((resolve, reject) => {
-      const data = Buffer.from(JSON.stringify(body))
+      const data = body === null ? null : Buffer.from(JSON.stringify(body))
+      const opts = { socketPath: sock, path, method, headers: {} }
+      if (data) {
+        opts.headers["content-type"] = "application/json"
+        opts.headers["content-length"] = data.length
+      }
       const req = http.request(
-        { agent, path, method: "POST", headers: { "content-type": "application/json", "content-length": data.length } },
+        opts,
         (res) => {
           let buf = ""
           res.on("data", (c) => (buf += c))
@@ -66,22 +77,6 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
       )
       req.on("error", reject)
       req.end(data)
-    })
-  }
-
-  function get(path) {
-    return new Promise((resolve, reject) => {
-      const req = http.request({ agent, path, method: "GET" }, (res) => {
-        let buf = ""
-        res.on("data", (c) => (buf += c))
-        res.on("end", () => {
-          let json = null
-          try { json = buf ? JSON.parse(buf) : null } catch {}
-          resolve({ status: res.statusCode, json })
-        })
-      })
-      req.on("error", reject)
-      req.end()
     })
   }
 
