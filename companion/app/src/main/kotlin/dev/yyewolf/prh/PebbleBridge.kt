@@ -1,8 +1,11 @@
 package dev.yyewolf.prh
 
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import com.getpebble.android.kit.PebbleKit
 import com.getpebble.android.kit.util.PebbleDictionary
+import com.getpebble.android.kit.Constants
 import java.util.UUID
 
 /**
@@ -52,6 +55,8 @@ class PebbleBridge(private val context: Context) {
         const val CHOICE_SEPARATOR = '\u001F'
     }
 
+    private var receiver: PebbleKit.PebbleDataReceiver? = null
+
     /** Whether a watch is currently connected. */
     fun isConnected(): Boolean =
         PebbleKit.isWatchConnected(context)
@@ -91,12 +96,15 @@ class PebbleBridge(private val context: Context) {
     /**
      * Registers the handler for replies coming back from the watch.
      *
-     * Acks every message — the watchapp waits on the ack to clear its pending
-     * state.
+     * Registers the BroadcastReceiver manually with RECEIVER_NOT_EXPORTED on
+     * API 34+, because PebbleKit's own registerReceivedDataHandler does not
+     * pass the flag and crashes on Android 14+.
      */
     fun onReply(handler: (Reply) -> Unit) {
-        PebbleKit.registerReceivedDataHandler(context, object : PebbleKit.PebbleDataReceiver(WATCHAPP_UUID) {
-            override fun receiveData(context: Context, transactionId: Int, dict: PebbleDictionary) {
+        if (receiver != null) return
+
+        receiver = object : PebbleKit.PebbleDataReceiver(WATCHAPP_UUID) {
+            override fun receiveData(ctx: Context, transactionId: Int, dict: PebbleDictionary) {
                 val id = dict.getString(KEY_REPLY_ID) ?: return
                 val actionWire = dict.getInteger(KEY_REPLY_ACTION)?.toInt() ?: return
                 val action = ReplyAction.fromWire(actionWire) ?: return
@@ -105,8 +113,27 @@ class PebbleBridge(private val context: Context) {
                 val text = dict.getString(KEY_REPLY_TEXT) ?: ""
                 handler(Reply(eventId = id, action = action, choice = choice, text = text))
 
-                PebbleKit.sendAckToPebble(context, transactionId)
+                PebbleKit.sendAckToPebble(ctx, transactionId)
             }
-        })
+        }
+
+        val filter = IntentFilter()
+        filter.addAction("com.getpebble.android.app.RECEIVE")
+        filter.addDataScheme("pebble")
+        filter.addDataAuthority(WATCHAPP_UUID.toString(), null)
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(receiver, filter)
+        }
+    }
+
+    /** Unregisters the reply receiver. Call when the service is destroyed. */
+    fun shutdown() {
+        receiver?.let {
+            try { context.unregisterReceiver(it) } catch (e: Exception) { /* already unregistered */ }
+            receiver = null
+        }
     }
 }

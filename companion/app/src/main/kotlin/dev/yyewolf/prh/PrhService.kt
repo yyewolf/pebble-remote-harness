@@ -69,6 +69,7 @@ class PrhService : Service() {
     }
 
     override fun onDestroy() {
+        bridge.shutdown()
         scope.cancel()
         super.onDestroy()
     }

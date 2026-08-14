@@ -9,9 +9,12 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.view.setPadding
@@ -45,33 +48,56 @@ class SettingsActivity : Activity() {
 
         parseDeepLink(intent)
 
+        val scroll = ScrollView(this).apply {
+            fitsSystemWindows = true
+            clipToPadding = false
+        }
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(48)
+            setPadding(48, 24, 48, 48)
             gravity = Gravity.CENTER_HORIZONTAL
         }
 
-        val hostLabel = TextView(this).apply { text = "Host" }
+        val hostLabel = TextView(this).apply {
+            text = "Host"
+            textSize = 16f
+            setPadding(0, 0, 0, 8)
+        }
         hostField = EditText(this).apply {
             hint = "e.g. 192.168.1.10"
             inputType = InputType.TYPE_CLASS_TEXT
             maxLines = 1
+            setPadding(24, 16, 24, 16)
         }
-        val portLabel = TextView(this).apply { text = "Port" }
+        val portLabel = TextView(this).apply {
+            text = "Port"
+            textSize = 16f
+            setPadding(0, 16, 0, 8)
+        }
         portField = EditText(this).apply {
             hint = "8477"
             inputType = InputType.TYPE_CLASS_NUMBER
             setText("8477")
             maxLines = 1
+            setPadding(24, 16, 24, 16)
         }
-        val pwLabel = TextView(this).apply { text = "Password" }
+        val pwLabel = TextView(this).apply {
+            text = "Password"
+            textSize = 16f
+            setPadding(0, 16, 0, 8)
+        }
         passwordField = EditText(this).apply {
             hint = "Pairing password"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             maxLines = 1
+            setPadding(24, 16, 24, 16)
         }
         pairButton = Button(this).apply { text = "Pair" }
-        statusText = TextView(this).apply { text = "Not paired" }
+        statusText = TextView(this).apply {
+            text = "Not paired"
+            setPadding(0, 16, 0, 0)
+        }
 
         root.addView(hostLabel)
         root.addView(hostField)
@@ -81,7 +107,8 @@ class SettingsActivity : Activity() {
         root.addView(passwordField)
         root.addView(pairButton)
         root.addView(statusText)
-        setContentView(root)
+        scroll.addView(root)
+        setContentView(scroll)
 
         prefill()
         pairButton.setOnClickListener { doPair() }
