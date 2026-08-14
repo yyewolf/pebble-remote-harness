@@ -30,3 +30,24 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# prh daemon build output
+bin/
+
+# VSCode extension
+node_modules/
+extension/out/
+*.vsix
+
+# Pebble watchapp
+watchapp/build/
+*.pbw
+
+# Android companion
+.gradle/
+companion/build/
+companion/app/build/
+companion/local.properties
+*.apk
+*.keystore
+
