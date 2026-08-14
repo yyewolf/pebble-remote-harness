@@ -82,9 +82,45 @@ Three details that matter:
 |---|---|---|
 | `permission.asked` | above | `perm` envelope |
 | `permission.replied` | `{sessionID, requestID, reply}` | **retracts** the envelope |
-| `question.asked` | `{id, sessionID, …}` | `ques` envelope |
+| `question.asked` | below | `ques` envelope |
+| `question.replied` | `{sessionID, requestID, answers[][]}` | retracts the envelope |
 | `session.idle` | `{sessionID}` | `idle` envelope |
 | `session.error` | `{sessionID, error}` | `err` envelope |
+
+### question.asked
+
+**Schema-derived, not observed** — unlike the permission payload above, this
+has not been captured from a live prompt. Treat the field names as likely but
+unconfirmed, and verify against a real question before trusting them. Kilo
+runs with `KILO_ENABLE_QUESTION_TOOL=true`, so triggering one is possible.
+
+```jsonc
+{ "id": "que_…", "sessionID": "ses_…", "blocking": true,
+  "tool": { "messageID": "msg_…", "callID": "…" },
+  "questions": [                       // note: an ARRAY of questions
+    { "question": "Which approach?",   // full text
+      "header": "Approach",            // short label, max 30 chars
+      "multiple": false,               // multi-select
+      "custom": false,                 // free-text answer allowed
+      "options": [
+        { "label": "Use a queue",      // 1-5 words — fits the watch
+          "description": "Explanation of the choice" }
+      ] } ] }
+```
+
+Three consequences for the watch:
+
+- `questions` is a **list**. A single envelope cannot represent a multi-part
+  question; either send one envelope per question or answer only the first.
+  Decide before implementing `ques`.
+- `header` (≤30 chars) and `option.label` (1–5 words) are already
+  watch-shaped. Use those, not `question`/`description`.
+- `custom: true` means free text is expected, which on a watch means
+  dictation. `multiple: true` means several answers — the current
+  single-choice reply cannot express it.
+
+`question.replied` carries `answers` as an array of string arrays, one per
+question, which is consistent with the multi-question shape.
 
 `permission.replied` was an unexpected find and is worth handling: it fires
 when a prompt is answered *anywhere*, including in the VSCode UI. Without it

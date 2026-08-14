@@ -49,6 +49,7 @@ Full detail in [docs/architecture.md](docs/architecture.md).
 
 ## Docs
 
+- [implementation.md](docs/implementation.md) — **start here to build**: ordered milestones, what is verified vs assumed, traps already paid for
 - [architecture.md](docs/architecture.md) — the five components, and one daemon across many windows
 - [plugin.md](docs/plugin.md) — **the security model**: threat model, trust boundary, install lifecycle
 - [protocol.md](docs/protocol.md) — the v1 wire contract, all three hops

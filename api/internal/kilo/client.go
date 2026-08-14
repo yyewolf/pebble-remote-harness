@@ -78,15 +78,39 @@ type PermissionReplied struct {
 	Reply     string `json:"reply"` // once | always | reject
 }
 
-// QuestionAsked is the payload of question.v2.asked.
+// QuestionAsked is the payload of question.asked.
 //
-// TODO: transcribe QuestionV2Info from the live /doc spec. The shape of an
-// individual question (prompt text, choice list, whether free text is allowed)
-// determines how the watch renders it.
+// Schema-derived, NOT observed on the wire — unlike PermissionAsked. Verify
+// against a live question before trusting the field names.
 type QuestionAsked struct {
-	ID        string          `json:"id"` // "que..."
-	SessionID string          `json:"sessionID"`
-	Questions json.RawMessage `json:"questions"`
+	ID        string         `json:"id"` // "que..."
+	SessionID string         `json:"sessionID"`
+	Blocking  bool           `json:"blocking"`
+	Questions []QuestionInfo `json:"questions"`
+}
+
+// QuestionInfo is one question. Note that an event carries several, which the
+// single-choice envelope cannot represent — see docs/kilo-integration.md.
+type QuestionInfo struct {
+	// Question is the full text; Header is a short label, max 30 chars, and
+	// is the one that fits a 200px screen.
+	Question string `json:"question"`
+	Header   string `json:"header"`
+
+	Options []QuestionOption `json:"options"`
+
+	// Multiple means several answers are expected; Custom means free text is
+	// allowed, which on a watch means dictation. Neither is expressible in
+	// the current reply vocabulary.
+	Multiple bool `json:"multiple"`
+	Custom   bool `json:"custom"`
+}
+
+// QuestionOption is one choice. Label is 1-5 words and is what the watch
+// shows; Description is the long form and generally will not fit.
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
 }
 
 // SessionRef is the payload of session.idle.
