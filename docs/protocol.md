@@ -54,14 +54,26 @@ this; a bounded queue that drops on overflow is correct.
 ```jsonc
 { "upstream_id": "up_3f9a",
   "events": [
-    { "kind": "permission",        // permission | question | idle | error
+    { "kind": "permission",        // permission | question | idle | error | replied
       "request_id": "per_01H…",    // the ID a decision must match
       "session_id": "ses_01H…",
-      "action": "bash",
-      "resources": ["rm -rf build/"],
-      "can_save": true }           // whether "always" is offered
+      "action": "bash",            // Kilo's "permission" field
+      "resources": ["rm -rf build/"],   // Kilo's "patterns" field
+      "description": "Remove the build directory",  // metadata.description
+      "always": ["rm *"] }         // what "always" would grant — see below
   ] }
 ```
+
+Field names follow Kilo's **v1** `permission.asked`, which is what actually
+fires; the v2 schema's `action`/`resources`/`save` never appear on the wire.
+
+`always` is broader than the command. Approving `rm -rf build/` with "always"
+grants `rm *`. `prh` must render the choice as `Always: rm *` rather than a
+bare "Always", or the user consents to something they were never shown.
+
+`kind: "replied"` carries only `request_id` and `session_id`. It fires when a
+prompt is answered anywhere — including the VSCode UI — and becomes a `gone`
+envelope so the watch stops asking a settled question.
 
 `prh` truncates to the limits below and turns these into envelopes.
 
@@ -163,6 +175,7 @@ are truncated by `prh`, not by the companion, so truncation is consistent.
 | `idle` | `session.idle` | Notify only, no reply expected |
 | `err`  | `session.error` | Notify only, no reply expected |
 | `note` | internal | Status text, no reply expected |
+| `gone` | `permission.replied` | Dismiss `id`; it was answered elsewhere |
 
 ### `POST /v1/reply`
 
@@ -211,7 +224,7 @@ generates `MESSAGE_KEY_*` in C.
 | Key | Type | Notes |
 |---|---|---|
 | `EVENT_ID` | string | echoed back in the reply |
-| `EVENT_TYPE` | uint8 | 1 perm, 2 ques, 3 idle, 4 err, 5 note |
+| `EVENT_TYPE` | uint8 | 1 perm, 2 ques, 3 idle, 4 err, 5 note, 6 gone |
 | `PROJECT` | string | which window is asking; shown in the header |
 | `SESSION` | string | opaque session id, for dictation routing |
 | `TITLE` | string | the action |

@@ -52,3 +52,6 @@ companion/local.properties
 *.apk
 *.keystore
 
+
+# temporary Kilo probe plugin (not part of the project)
+.kilo/

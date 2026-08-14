@@ -28,7 +28,10 @@ enum class EventType(val wire: Int, val slug: String) {
     QUES(2, "ques"),
     IDLE(3, "idle"),
     ERR(4, "err"),
-    NOTE(5, "note");
+    NOTE(5, "note"),
+
+    /** Answered elsewhere (e.g. the VSCode UI); dismiss it on the watch. */
+    GONE(6, "gone");
 
     /** Whether the watch should be woken and shown answer affordances. */
     val needsReply: Boolean get() = this == PERM || this == QUES

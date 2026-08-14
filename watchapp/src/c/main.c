@@ -15,6 +15,9 @@ typedef enum {
   EVENT_IDLE = 3,
   EVENT_ERR = 4,
   EVENT_NOTE = 5,
+  // Answered elsewhere, e.g. in the VSCode UI. Dismiss it rather than keep
+  // asking a settled question.
+  EVENT_GONE = 6,
 } EventType;
 
 // Mirrors protocol.ReplyAction.
