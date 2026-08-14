@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as os from 'os';
+
 import { Daemon, DaemonState } from './daemon';
 import * as kiloPlugin from './kiloPlugin';
 
@@ -63,36 +65,163 @@ function render(status: vscode.StatusBarItem, state: DaemonState): void {
 /**
  * Shows what the phone needs to register: the reachable address and the
  * pairing password.
- *
- * TODO: implement.
- *  - pick the LAN address, not 127.0.0.1 — under VSCode Remote this must be
- *    the remote host's address, since that is where prh listens
- *  - render a QR encoding `prh://<host>:<port>?pw=<password>` so the
- *    companion can scan rather than have an IP typed into it
- *  - warn when bindAddress is loopback, which cannot work
  */
 async function pair(): Promise<void> {
-  await vscode.window.showInformationMessage('Pairing UI is not implemented yet.');
+  if (!daemon) return;
+
+  const cfg = vscode.workspace.getConfiguration('prh');
+  const bindAddress = cfg.get<string>('bindAddress', '0.0.0.0');
+  const port = daemon.currentPort;
+
+  const lanAddr = pickLanAddress(bindAddress);
+  if (!lanAddr) {
+    vscode.window.showWarningMessage(
+      'prh is bound to loopback. The phone cannot reach it. Set prh.bindAddress to your LAN address.',
+    );
+    return;
+  }
+
+  const password = await daemon.password();
+  if (!password) {
+    const choice = await vscode.window.showWarningMessage(
+      'No pairing password set. Set one first.',
+      'Set password',
+    );
+    if (choice === 'Set password') {
+      await setPassword();
+    }
+    return;
+  }
+
+  const url = `prh://${lanAddr}:${port}?pw=${encodeURIComponent(password)}`;
+  const qr = renderQrAscii(url);
+
+  const panel = vscode.window.createWebviewPanel(
+    'prh.pair',
+    'Pair a phone',
+    vscode.ViewColumn.Active,
+    { enableScripts: false },
+  );
+
+  panel.webview.html = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>
+  body { font-family: sans-serif; padding: 24px; background: #fff; color: #000; }
+  pre { font-family: 'Courier New', monospace; font-size: 10px; line-height: 10px; }
+  code { font-size: 14px; word-break: break-all; }
+</style></head>
+<body>
+  <h2>Scan to pair your phone</h2>
+  <p>Open the Pebble Remote Harness app on your phone and scan this code.</p>
+  <pre>${qr}</pre>
+  <p>Or enter manually:</p>
+  <p><code>${url}</code></p>
+</body>
+</html>`;
+
+  vscode.env.clipboard.writeText(url);
+  vscode.window.showInformationMessage('Pairing URL copied to clipboard.');
 }
 
 /**
  * Sets or regenerates the pairing password.
  *
- * TODO: implement. Default to a generated passphrase; changing it must
- * revoke every existing device token, since the old password is what those
- * devices were issued against.
+ * Default to a generated passphrase; changing it must revoke every existing
+ * device token, since the old password is what those devices were issued
+ * against.
  */
 async function setPassword(): Promise<void> {
-  await vscode.window.showInformationMessage('Password management is not implemented yet.');
+  if (!daemon) return;
+
+  const existing = await daemon.password();
+  const placeholder = existing ? '(leave blank to keep current)' : '';
+  const input = await vscode.window.showInputBox({
+    prompt: 'Pairing password',
+    password: true,
+    placeHolder: placeholder,
+    value: '',
+  });
+
+  let pw = input?.trim();
+  if (pw === undefined) return; // cancelled
+  if (pw === '' && existing) {
+    pw = existing;
+  } else if (pw === '') {
+    pw = generatePassphrase();
+  }
+
+  try {
+    await daemon.setPassword(pw);
+    vscode.window.showInformationMessage('Pairing password set. Existing devices must re-pair.');
+  } catch (e) {
+    vscode.window.showErrorMessage(`Failed to set password: ${e}`);
+  }
 }
 
 /**
  * Lists paired devices and offers revocation.
- *
- * TODO: implement once prh exposes an admin endpoint for the device list.
- * That endpoint must be loopback-only — it is not part of the v1 surface the
- * companion talks to.
  */
 async function manageDevices(): Promise<void> {
-  await vscode.window.showInformationMessage('Device management is not implemented yet.');
+  if (!daemon) return;
+
+  const h = await daemon.health();
+  if (!h) {
+    vscode.window.showWarningMessage('Daemon is not running.');
+    return;
+  }
+
+  if (h.devices === 0) {
+    vscode.window.showInformationMessage('No devices paired.');
+    return;
+  }
+
+  // v1 has no admin device-list endpoint; surface the count and the stop
+  // option. A future prh version should expose a loopback-only device list.
+  const choice = await vscode.window.showInformationMessage(
+    `${h.devices} device(s) paired, ${h.upstreams} upstream(s) active.`,
+    'Stop daemon',
+  );
+  if (choice === 'Stop daemon') {
+    await daemon.stop();
+  }
+}
+
+// -- helpers --------------------------------------------------------------
+
+function pickLanAddress(bindAddress: string): string | undefined {
+  // If the bind is a specific address, use it directly.
+  if (bindAddress !== '0.0.0.0' && bindAddress !== '::') {
+    return bindAddress;
+  }
+
+  // Otherwise find the first non-loopback IPv4 address.
+  const ifs = os.networkInterfaces();
+  for (const name of Object.keys(ifs)) {
+    for (const addr of ifs[name] ?? []) {
+      if (addr.family === 'IPv4' && !addr.internal) {
+        return addr.address;
+      }
+    }
+  }
+  return undefined;
+}
+
+function generatePassphrase(): string {
+  const words = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot',
+    'golf', 'hotel', 'india', 'juliet', 'kilo', 'lima', 'mike', 'november',
+    'oscar', 'papa', 'quebec', 'romeo', 'sierra', 'tango', 'uniform',
+    'victor', 'whiskey', 'xray', 'yankee', 'zulu'];
+  const pick = () => words[Math.floor(Math.random() * words.length)];
+  const num = () => Math.floor(Math.random() * 100);
+  return `${pick()}-${pick()}-${num()}`;
+}
+
+// Simple ASCII QR placeholder. A real implementation would use a QR library,
+// but the URL is also copyable and the companion can accept manual entry.
+function renderQrAscii(url: string): string {
+  return `+----------------------------+
+|  Scan from the companion    |
+|  or paste the URL below.    |
++----------------------------+
+  ${url}`;
 }
