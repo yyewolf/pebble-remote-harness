@@ -5,6 +5,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { spawn } from 'child_process';
+import * as http from 'http';
+import * as crypto from 'crypto';
 
 export type DaemonState = 'stopped' | 'starting' | 'running' | 'unpaired' | 'failed';
 
@@ -13,8 +15,15 @@ export interface Health {
   uptime_sec: number;
   upstreams: number;
   devices: number;
+  sessions: number;
   listen: string;
   paired: boolean;
+  pairing: boolean;
+}
+
+export interface PairingStatus {
+  open: boolean;
+  expires_at?: number;
 }
 
 /**
@@ -236,6 +245,83 @@ export class Daemon implements vscode.Disposable {
   }
 
   // -- socket & lock helpers ---------------------------------------------
+
+  /**
+   * Arms a pairing window and returns the key the phone must present.
+   *
+   * The key is generated here rather than by prh because this is the process
+   * that has to display it. It is never written to disk, never logged, and
+   * prh keeps it only for the life of the window.
+   *
+   * Sent over the unix socket, not the network listener: the ability to open
+   * enrolment must not be reachable by the people enrolment defends against.
+   */
+  async openPairing(ttlSec: number): Promise<{ key: string; expiresAt: number }> {
+    const key = crypto.randomBytes(32).toString('base64url');
+    const status = await this.adminRequest<PairingStatus>('POST', '/admin/v1/pairing', {
+      pairing_key: key,
+      ttl_sec: ttlSec,
+    });
+    return { key, expiresAt: status.expires_at ?? 0 };
+  }
+
+  /** Disarms the window early — e.g. when the user closes the pairing panel. */
+  async closePairing(): Promise<void> {
+    try {
+      await this.adminRequest<PairingStatus>('DELETE', '/admin/v1/pairing', null);
+    } catch {
+      // Best effort. The window expires on its own, so failing to close it
+      // early is not worth interrupting the user over.
+    }
+  }
+
+  /**
+   * One request against the admin plane on the plugin socket.
+   *
+   * Node's http client speaks to a unix socket via `socketPath`; the hostname
+   * in the URL is ignored but must be present.
+   */
+  private adminRequest<T>(method: string, route: string, body: unknown): Promise<T> {
+    const payload = body === null ? undefined : Buffer.from(JSON.stringify(body));
+
+    return new Promise<T>((resolve, reject) => {
+      const req = http.request(
+        {
+          socketPath: this.socketPath(),
+          path: route,
+          method,
+          timeout: 5000,
+          headers: payload
+            ? { 'content-type': 'application/json', 'content-length': payload.length }
+            : {},
+        },
+        (res) => {
+          let buf = '';
+          res.on('data', (c) => (buf += c));
+          res.on('end', () => {
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              try {
+                resolve(buf ? JSON.parse(buf) : ({} as T));
+              } catch (e) {
+                reject(new Error(`malformed response from prh: ${buf}`));
+              }
+              return;
+            }
+            reject(new Error(`prh returned ${res.statusCode}: ${buf}`));
+          });
+        },
+      );
+      req.on('error', (e) =>
+        reject(new Error(`prh is not reachable on its socket: ${e.message}`)),
+      );
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('prh did not answer on its socket'));
+      });
+      if (payload) req.write(payload);
+      req.end();
+    });
+  }
 
   private socketPath(): string {
     const xdg = process.env.XDG_RUNTIME_DIR;

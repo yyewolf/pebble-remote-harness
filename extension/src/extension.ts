@@ -63,8 +63,18 @@ function render(status: vscode.StatusBarItem, state: DaemonState): void {
 }
 
 /**
- * Shows what the phone needs to register: the reachable address and the
- * pairing password.
+ * Opens a pairing window and shows the code the phone scans.
+ *
+ * The QR carries a freshly generated 32-byte pairing key, not the passphrase.
+ * That distinction is the whole point: the phone signs its registration with
+ * the key and prh returns the device secret encrypted under it, so anyone
+ * watching the network sees a signature and a sealed blob and gains nothing.
+ * Screen-to-camera is a channel an attacker on your LAN cannot reach; sending
+ * a passphrase over plaintext HTTP threw that advantage away.
+ *
+ * The window is armed for a couple of minutes and closes the moment one device
+ * enrols, so enrolment stops being a standing invitation to anyone who ever
+ * learns the passphrase.
  */
 async function pair(): Promise<void> {
   if (!daemon) return;
@@ -81,19 +91,16 @@ async function pair(): Promise<void> {
     return;
   }
 
-  const password = await daemon.password();
-  if (!password) {
-    const choice = await vscode.window.showWarningMessage(
-      'No pairing password set. Set one first.',
-      'Set password',
-    );
-    if (choice === 'Set password') {
-      await setPassword();
-    }
+  const ttlSec = 120;
+  let pairing: { key: string; expiresAt: number };
+  try {
+    pairing = await daemon.openPairing(ttlSec);
+  } catch (e) {
+    vscode.window.showErrorMessage(`Could not start pairing: ${(e as Error).message}`);
     return;
   }
 
-  const url = `prh://${lanAddr}:${port}?pw=${encodeURIComponent(password)}`;
+  const url = `prh://${lanAddr}:${port}?k=${pairing.key}`;
   const qr = renderQrAscii(url);
 
   const panel = vscode.window.createWebviewPanel(
@@ -109,18 +116,33 @@ async function pair(): Promise<void> {
   body { font-family: sans-serif; padding: 24px; background: #fff; color: #000; }
   pre { font-family: 'Courier New', monospace; font-size: 10px; line-height: 10px; }
   code { font-size: 14px; word-break: break-all; }
+  .warn { color: #a00; }
 </style></head>
 <body>
   <h2>Scan to pair your phone</h2>
-  <p>Open the Pebble Remote Harness app on your phone and scan this code.</p>
+  <p>Open the Pebble Remote Harness app and scan this code within
+     <strong>${ttlSec} seconds</strong>. It stops working as soon as one phone
+     pairs.</p>
   <pre>${qr}</pre>
   <p>Or enter manually:</p>
   <p><code>${url}</code></p>
+  <p class="warn">This code is a one-time secret. Do not paste it anywhere but
+     the app.</p>
 </body>
 </html>`;
 
-  vscode.env.clipboard.writeText(url);
-  vscode.window.showInformationMessage('Pairing URL copied to clipboard.');
+  // Closing the panel is the user saying they are done, whether or not a phone
+  // enrolled. Shutting the window early costs nothing and narrows the gap.
+  panel.onDidDispose(() => {
+    void daemon?.closePairing();
+  });
+
+  // Deliberately not copied to the clipboard. The old flow copied a pairing
+  // URL automatically, which put a live credential somewhere every app on the
+  // machine can read, and left it there long after pairing finished.
+  vscode.window.showInformationMessage(
+    `Pairing open for ${ttlSec} seconds. Close the panel when you are done.`,
+  );
 }
 
 /**
@@ -155,7 +177,9 @@ async function setPassword(): Promise<void> {
 
   try {
     await daemon.setPassword(pw);
-    vscode.window.showInformationMessage('Pairing password set. Existing devices must re-pair.');
+    vscode.window.showInformationMessage(
+      'Pairing password set. Existing devices keep working — they sign with their own secrets.',
+    );
   } catch (e) {
     vscode.window.showErrorMessage(`Failed to set password: ${e}`);
   }
