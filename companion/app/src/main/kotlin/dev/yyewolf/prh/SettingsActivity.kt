@@ -168,9 +168,15 @@ class SettingsActivity : Activity() {
             try {
                 val client = PrhClient(baseUrl)
                 val deviceName = PrhPrefs.getDeviceName(this@SettingsActivity)
-                val token = client.register(pw, deviceName)
+
+                // The one moment the passphrase is used. What comes back is
+                // the device secret, which is what everything afterwards signs
+                // with — so this screen is not needed again unless the pairing
+                // is revoked or prh loses its devices file.
+                val (deviceId, deviceSecret) = client.register(pw, deviceName)
                 PrhPrefs.setBaseUrl(this@SettingsActivity, baseUrl)
-                PrhPrefs.setToken(this@SettingsActivity, token)
+                PrhPrefs.setCredentials(this@SettingsActivity, deviceId, deviceSecret)
+
                 withContext(Dispatchers.Main) {
                     statusText.text = "Paired"
                     Toast.makeText(this@SettingsActivity, "Paired", Toast.LENGTH_SHORT).show()

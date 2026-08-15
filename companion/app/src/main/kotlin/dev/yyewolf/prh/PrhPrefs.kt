@@ -7,20 +7,30 @@ import androidx.security.crypto.MasterKey
 /**
  * Persistent storage for the companion.
  *
- * The device token lives in [EncryptedSharedPreferences] because it is a
- * bearer credential: anyone with it can approve prompts. The cursor is
- * plain prefs — it is not sensitive and encrypted prefs would make its
- * read on every poll unnecessarily slow.
+ * The device secret lives in [EncryptedSharedPreferences]: it is the credential
+ * that lets this phone approve shell commands, and it is the one thing that
+ * must survive both a phone reboot and a prh restart. Remembering it is what
+ * removes the pairing passphrase from everyday use — the passphrase is typed
+ * once, at pairing, and then never again.
+ *
+ * The session key is deliberately *not* stored. It is short-lived, cheap to
+ * re-obtain, and worthless once prh restarts, so writing it to disk would add
+ * a persistent copy of a credential for no benefit.
+ *
+ * Nor is the passphrase stored. Storing it would mean holding a secret that
+ * can enrol *new* devices, in order to solve a problem the device secret
+ * already solves.
+ *
+ * The cursor is plain prefs — not sensitive, and read on every poll.
  */
 object PrhPrefs {
 
     private const val FILE_SECURE = "prh_secure"
     private const val FILE_PLAIN = "prh_prefs"
 
-    private const val KEY_TOKEN = "token"
+    private const val KEY_DEVICE_SECRET = "device_secret"
     private const val KEY_BASE_URL = "base_url"
     private const val KEY_DEVICE_ID = "device_id"
-    private const val KEY_DEVICE_NAME = "device_name"
     private const val KEY_CURSOR = "cursor"
 
     private fun securePrefs(context: Context) = EncryptedSharedPreferences.create(
@@ -34,24 +44,21 @@ object PrhPrefs {
     private fun plainPrefs(context: Context) =
         context.getSharedPreferences(FILE_PLAIN, Context.MODE_PRIVATE)
 
-    // -- token -------------------------------------------------------------
+    // -- device credentials --------------------------------------------------
 
-    fun getToken(context: Context): String? =
-        securePrefs(context).getString(KEY_TOKEN, null)
-
-    fun setToken(context: Context, token: String?) {
-        securePrefs(context).edit().apply {
-            if (token == null) remove(KEY_TOKEN) else putString(KEY_TOKEN, token)
-        }.apply()
-    }
-
-    // -- device info -------------------------------------------------------
+    /** base64url, as returned by POST /v1/register. Never transmitted. */
+    fun getDeviceSecret(context: Context): String? =
+        securePrefs(context).getString(KEY_DEVICE_SECRET, null)
 
     fun getDeviceId(context: Context): String? =
         securePrefs(context).getString(KEY_DEVICE_ID, null)
 
-    fun setDeviceId(context: Context, id: String) {
-        securePrefs(context).edit().putString(KEY_DEVICE_ID, id).apply()
+    /** Stores both halves of the pairing, or clears both. */
+    fun setCredentials(context: Context, deviceId: String?, deviceSecret: String?) {
+        securePrefs(context).edit().apply {
+            if (deviceId == null) remove(KEY_DEVICE_ID) else putString(KEY_DEVICE_ID, deviceId)
+            if (deviceSecret == null) remove(KEY_DEVICE_SECRET) else putString(KEY_DEVICE_SECRET, deviceSecret)
+        }.apply()
     }
 
     fun getDeviceName(context: Context): String =
@@ -77,6 +84,12 @@ object PrhPrefs {
 
     // -- paired? -----------------------------------------------------------
 
+    /**
+     * Paired means we can obtain a session without the user: a device ID, its
+     * secret, and somewhere to send them.
+     */
     fun isPaired(context: Context): Boolean =
-        getToken(context) != null && getBaseUrl(context) != null
+        getDeviceId(context) != null &&
+            getDeviceSecret(context) != null &&
+            getBaseUrl(context) != null
 }

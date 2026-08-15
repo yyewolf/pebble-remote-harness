@@ -15,26 +15,112 @@ import java.net.URL
  * Uses [HttpURLConnection] to avoid pulling OkHttp as a dependency. The
  * long-poll is the only demanding part and it needs nothing beyond a long
  * read timeout and careful retry.
+ *
+ * Every request after registration is signed. Two consequences shape this
+ * class:
+ *
+ *  - the body has to be materialised before the request is opened, because it
+ *    is part of what gets signed
+ *  - a 401 is a *routine* condition, not a failure. It means the session key
+ *    is gone — almost always because prh restarted — and the fix is to log in
+ *    again and retry once, with no user involvement.
  */
 class PrhClient(
     private val baseUrl: String,
-    private var token: String? = null,
+    private val deviceId: String? = null,
+    private val deviceSecret: String? = null,
 ) {
 
     class CursorTooOld : Exception("cursor fell out of the server's ring buffer")
 
-    /** Trades the pairing password for a device token. */
-    suspend fun register(password: String, deviceName: String): String = withContext(Dispatchers.IO) {
-        val body = JSONObject().apply {
-            put("password", password)
-            put("device_name", deviceName)
-            put("platform", "android")
+    /**
+     * The device is not registered with this prh at all, so no amount of
+     * retrying will help — the user has to re-pair with the passphrase. Worth
+     * distinguishing from a transient failure so the UI can say something
+     * useful instead of retrying forever.
+     */
+    class NotPaired(message: String) : IOException(message)
+
+    private var sessionKeyId: String? = null
+    private var sessionKey: ByteArray? = null
+
+    /**
+     * Offset to add to our clock to match the server's, learned from the
+     * X-Prh-Time header on a skew rejection.
+     *
+     * Without this, a phone whose clock has drifted past the leeway fails
+     * every request with a 401 that looks exactly like a bad credential, and
+     * no amount of re-pairing fixes it.
+     */
+    private var clockOffsetSec: Long = 0
+
+    val isLoggedIn: Boolean get() = sessionKey != null
+
+    /**
+     * Trades the pairing passphrase for a device secret. The only call that
+     * carries the passphrase, and the only one that is not signed.
+     */
+    suspend fun register(password: String, deviceName: String): Pair<String, String> =
+        withContext(Dispatchers.IO) {
+            val body = JSONObject().apply {
+                put("password", password)
+                put("device_name", deviceName)
+                put("platform", "android")
+            }
+            val resp = doJson("POST", "/v1/register", body.toString().toByteArray(), null)
+            val id = resp.optString("device_id", "")
+            val secret = resp.optString("device_secret", "")
+            if (id.isEmpty() || secret.isEmpty()) {
+                throw IOException("register: no device credentials in response")
+            }
+            id to secret
         }
-        val resp = doJson("POST", "/v1/register", body.toString())
-        val token = resp.optString("token", "")
-        if (token.isEmpty()) throw IOException("register: no token in response")
-        this@PrhClient.token = token
-        token
+
+    /**
+     * Obtains a session key, proving possession of the device secret by
+     * signing the request with it.
+     *
+     * This is what makes a prh restart invisible: the daemon forgets sessions
+     * but not devices, so the phone re-establishes one on its own.
+     */
+    suspend fun login(): Unit = withContext(Dispatchers.IO) {
+        val id = deviceId ?: throw NotPaired("no device id")
+        val secretB64 = deviceSecret ?: throw NotPaired("no device secret")
+        val secret = PrhSigning.decode(secretB64)
+
+        val body = JSONObject().apply { put("device_id", id) }.toString().toByteArray()
+        val resp = try {
+            doJson("POST", "/v1/login", body, SigningKey(id, secret))
+        } catch (e: HttpException) {
+            // prh knows nothing about this device: its devices.json was lost
+            // or the device was revoked. Only re-pairing fixes that.
+            if (e.code == 401) throw NotPaired("prh does not recognise this device; re-pair")
+            throw e
+        }
+
+        val keyId = resp.optString("key_id", "")
+        val key = PrhSigning.unwrapSessionKey(
+            deviceSecret = secret,
+            wrapSalt = resp.getString("wrap_salt"),
+            wrapNonce = resp.getString("wrap_nonce"),
+            wrappedKey = resp.getString("wrapped_key"),
+            keyId = keyId,
+        )
+        sessionKeyId = keyId
+        sessionKey = key
+    }
+
+    /**
+     * Confirms the session is still live.
+     *
+     * Its value is in the failure: a 401 here means prh restarted, and the
+     * caller logs in again before a prompt is waiting rather than after.
+     */
+    suspend fun heartbeat(): Unit = withContext(Dispatchers.IO) {
+        val resp = authed("POST", "/v1/heartbeat", null)
+        if (resp.code !in 200..299) {
+            throw HttpException(resp.code, "heartbeat failed: ${resp.body}")
+        }
     }
 
     /**
@@ -45,40 +131,33 @@ class PrhClient(
      * evicted: throw [CursorTooOld] so the caller resets.
      */
     suspend fun poll(cursor: Long, waitSeconds: Int = 55): Pair<Long, List<Envelope>> = withContext(Dispatchers.IO) {
-        val conn = openConn("GET", "/v1/poll?cursor=$cursor&wait=$waitSeconds")
-        conn.readTimeout = (waitSeconds + 10) * 1000
-        conn.connectTimeout = 10_000
-        try {
-            val code = conn.responseCode
-            when (code) {
-                200 -> {
-                    val resp = readJson(conn)
-                    val newCursor = resp.optLong("cursor", cursor)
-                    val arr = resp.optJSONArray("events") ?: JSONArray()
-                    val events = (0 until arr.length()).map { i ->
-                        val o = arr.getJSONObject(i)
-                        Envelope(
-                            id = o.getString("id"),
-                            seq = o.optLong("seq", 0),
-                            type = EventType.fromSlug(o.getString("type")),
-                            project = o.optString("project", ""),
-                            session = o.optString("session", ""),
-                            title = o.optString("title", ""),
-                            body = o.optString("body", ""),
-                            choices = o.optJSONArray("choices")?.let { ca ->
-                                (0 until ca.length()).map { ci -> ca.getString(ci) }
-                            } ?: emptyList(),
-                            expires = o.optLong("expires", 0),
-                        )
-                    }
-                    newCursor to events
+        val path = "/v1/poll?cursor=$cursor&wait=$waitSeconds"
+        val resp = authed("GET", path, null, readTimeoutMs = (waitSeconds + 10) * 1000)
+        when (resp.code) {
+            200 -> {
+                val json = JSONObject(resp.body.ifEmpty { "{}" })
+                val newCursor = json.optLong("cursor", cursor)
+                val arr = json.optJSONArray("events") ?: JSONArray()
+                val events = (0 until arr.length()).map { i ->
+                    val o = arr.getJSONObject(i)
+                    Envelope(
+                        id = o.getString("id"),
+                        seq = o.optLong("seq", 0),
+                        type = EventType.fromSlug(o.getString("type")),
+                        project = o.optString("project", ""),
+                        session = o.optString("session", ""),
+                        title = o.optString("title", ""),
+                        body = o.optString("body", ""),
+                        choices = o.optJSONArray("choices")?.let { ca ->
+                            (0 until ca.length()).map { ci -> ca.getString(ci) }
+                        } ?: emptyList(),
+                        expires = o.optLong("expires", 0),
+                    )
                 }
-                410 -> throw CursorTooOld()
-                401 -> throw IOException("auth failed (401)")
-                else -> throw IOException("poll failed: $code")
+                newCursor to events
             }
-        } finally {
-            conn.disconnect()
+            410 -> throw CursorTooOld()
+            else -> throw IOException("poll failed: ${resp.code}")
         }
     }
 
@@ -86,8 +165,9 @@ class PrhClient(
      * Answers a prompt via POST /v1/reply.
      *
      * Retries on network failure — this retry is what guarantees delivery,
-     * since the watch does not retry. HTTP 409 means already-answered and
-     * must not be retried.
+     * since the watch does not retry. HTTP 409 means already-answered and must
+     * not be retried; [authed] has already handled the 401 case by logging in
+     * again, so a 401 arriving here is final.
      */
     suspend fun reply(reply: Reply): Unit = withContext(Dispatchers.IO) {
         val body = JSONObject().apply {
@@ -95,17 +175,24 @@ class PrhClient(
             put("action", reply.action.slug)
             if (reply.action == ReplyAction.CHOICE) put("choice", reply.choice)
             if (reply.action == ReplyAction.TEXT) put("text", reply.text)
-        }
+        }.toString().toByteArray()
+
         val maxAttempts = 5
         var attempt = 0
         while (true) {
             attempt++
             try {
-                val resp = doJson("POST", "/v1/reply", body.toString())
+                val resp = authed("POST", "/v1/reply", body)
+                // Already answered, at the desk or by an earlier retry of this
+                // very request. Either way the prompt is settled.
+                if (resp.code == 409) return@withContext
+                if (resp.code !in 200..299) {
+                    throw HttpException(resp.code, "reply failed: ${resp.body}")
+                }
                 return@withContext
+            } catch (e: NotPaired) {
+                throw e // retrying cannot fix this
             } catch (e: HttpException) {
-                if (e.code == 409) return@withContext
-                if (e.code == 401) throw IOException("auth failed", e)
                 throw e
             } catch (e: IOException) {
                 if (attempt >= maxAttempts) throw e
@@ -119,68 +206,129 @@ class PrhClient(
         val body = JSONObject().apply {
             put("session", session)
             put("text", text)
-        }
-        try {
-            doJson("POST", "/v1/prompt", body.toString())
-        } catch (e: HttpException) {
-            if (e.code == 501) return@withContext
-            throw e
-        }
+        }.toString().toByteArray()
+
+        val resp = authed("POST", "/v1/prompt", body)
+        if (resp.code == 501) return@withContext // not implemented yet, by design
+        if (resp.code !in 200..299) throw HttpException(resp.code, "prompt failed: ${resp.body}")
     }
 
     /** Unauthenticated liveness probe, used by the settings screen. */
     suspend fun health(): Boolean = withContext(Dispatchers.IO) {
-        var conn: HttpURLConnection? = null
         try {
-            conn = openConn("GET", "/v1/health")
-            conn.readTimeout = 5_000
-            conn.connectTimeout = 5_000
-            conn.responseCode == 200
+            exec("GET", "/v1/health", null, null, readTimeoutMs = 5_000).code == 200
         } catch (e: IOException) {
             false
-        } finally {
-            conn?.disconnect()
         }
     }
 
     // -- internals ----------------------------------------------------------
 
-    private class HttpException(val code: Int, message: String) : IOException(message)
+    class HttpException(val code: Int, message: String) : IOException(message)
 
-    private fun openConn(method: String, path: String): HttpURLConnection {
-        val url = URL(baseUrl.trimEnd('/') + path)
-        val conn = url.openConnection() as HttpURLConnection
+    private class SigningKey(val keyId: String, val key: ByteArray)
+
+    private class Response(val code: Int, val body: String, val serverTime: Long?)
+
+    /**
+     * Performs a signed request, recovering from the two failures that are
+     * expected rather than exceptional.
+     *
+     * A 401 means one of:
+     *
+     *  - we have no session yet, or prh restarted and dropped it — log in and
+     *    retry, which is the whole reason the device secret is persisted
+     *  - our clock has drifted outside the leeway — the rejection carries the
+     *    server's time, so adopt the offset and retry
+     *
+     * Exactly one retry: if a fresh session signed with a corrected clock is
+     * still refused, the problem is not transient and looping would only bury
+     * it.
+     */
+    private suspend fun authed(
+        method: String,
+        path: String,
+        body: ByteArray?,
+        readTimeoutMs: Int = 15_000,
+    ): Response {
+        if (sessionKey == null) {
+            login()
+        }
+        val first = exec(method, path, body, currentKey(), readTimeoutMs)
+        if (first.code != 401) return first
+
+        // Adopt the server's clock before retrying: if skew is the problem, a
+        // new session signed with the same wrong time fails identically.
+        first.serverTime?.let { clockOffsetSec = it - System.currentTimeMillis() / 1000 }
+        login()
+        return exec(method, path, body, currentKey(), readTimeoutMs)
+    }
+
+    private fun currentKey(): SigningKey {
+        val id = sessionKeyId ?: throw IOException("no session key id")
+        val key = sessionKey ?: throw IOException("no session key")
+        return SigningKey(id, key)
+    }
+
+    /**
+     * One HTTP round trip, signed if a key is supplied.
+     *
+     * The body is written from a byte array rather than streamed because it
+     * has to be hashed into the signature first; there is no way to sign
+     * something that has not been produced yet.
+     */
+    private fun exec(
+        method: String,
+        path: String,
+        body: ByteArray?,
+        signing: SigningKey?,
+        readTimeoutMs: Int,
+    ): Response {
+        val conn = URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection
         conn.requestMethod = method
         conn.setRequestProperty("Accept", "application/json")
-        token?.let { conn.setRequestProperty("Authorization", "Bearer $it") }
-        if (method == "POST") {
+        conn.readTimeout = readTimeoutMs
+        conn.connectTimeout = 10_000
+        if (body != null) {
             conn.setRequestProperty("Content-Type", "application/json")
             conn.doOutput = true
         }
-        return conn
-    }
 
-    private fun doJson(method: String, path: String, body: String = ""): JSONObject {
-        val conn = openConn(method, path)
-        conn.readTimeout = 15_000
-        conn.connectTimeout = 10_000
+        if (signing != null) {
+            val nonce = PrhSigning.newNonce()
+            val date = (System.currentTimeMillis() / 1000 + clockOffsetSec).toString()
+            conn.setRequestProperty(PrhSigning.HEADER_KEY, signing.keyId)
+            conn.setRequestProperty(PrhSigning.HEADER_DATE, date)
+            conn.setRequestProperty(PrhSigning.HEADER_NONCE, nonce)
+            conn.setRequestProperty(
+                PrhSigning.HEADER_SIG,
+                PrhSigning.sign(signing.key, PrhSigning.canonical(method, path, date, nonce, body)),
+            )
+        }
+
         try {
-            if (body.isNotEmpty()) {
-                conn.outputStream.use { it.write(body.toByteArray()) }
+            if (body != null) {
+                conn.outputStream.use { it.write(body) }
             }
             val code = conn.responseCode
-            if (code in 200..299) {
-                return readJson(conn)
+            val text = if (code in 200..299) {
+                conn.inputStream.bufferedReader().use { it.readText() }
+            } else {
+                conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
             }
-            val errBody = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-            throw HttpException(code, "HTTP $code: $errBody")
+            val serverTime = conn.getHeaderField(PrhSigning.HEADER_SERVER_TIME)?.toLongOrNull()
+            return Response(code, text, serverTime)
         } finally {
             conn.disconnect()
         }
     }
 
-    private fun readJson(conn: HttpURLConnection): JSONObject {
-        val text = conn.inputStream.bufferedReader().use { it.readText() }
-        return if (text.isNotEmpty()) JSONObject(text) else JSONObject()
+    /** Unsigned or device-signed JSON call used by register and login. */
+    private fun doJson(method: String, path: String, body: ByteArray?, signing: SigningKey?): JSONObject {
+        val resp = exec(method, path, body, signing, readTimeoutMs = 15_000)
+        if (resp.code !in 200..299) {
+            throw HttpException(resp.code, "HTTP ${resp.code}: ${resp.body}")
+        }
+        return if (resp.body.isNotEmpty()) JSONObject(resp.body) else JSONObject()
     }
 }

@@ -35,6 +35,14 @@ class PrhService : Service() {
         const val NOTIFICATION_ID = 1
         private const val TAG = "PrhService"
 
+        /**
+         * Well under the 12h session TTL, and frequent enough that a prh
+         * restart is noticed before the next prompt rather than during it.
+         * One tiny signed request every few minutes is cheaper than a missed
+         * approval.
+         */
+        private const val HEARTBEAT_INTERVAL_MS = 4 * 60 * 1000L
+
         fun start(context: Context) {
             val intent = Intent(context, PrhService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -51,6 +59,7 @@ class PrhService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var pollJob: Job? = null
+    private var heartbeatJob: Job? = null
     private lateinit var client: PrhClient
     private lateinit var bridge: PebbleBridge
 
@@ -111,13 +120,17 @@ class PrhService : Service() {
         if (pollJob?.isActive == true) return
 
         val baseUrl = PrhPrefs.getBaseUrl(this)
-        val token = PrhPrefs.getToken(this)
-        if (baseUrl == null || token == null) {
+        val deviceId = PrhPrefs.getDeviceId(this)
+        val deviceSecret = PrhPrefs.getDeviceSecret(this)
+        if (baseUrl == null || deviceId == null || deviceSecret == null) {
             Log.w(TAG, "not paired, skipping poll loop")
             return
         }
         Log.i(TAG, "starting poll loop against $baseUrl")
-        client = PrhClient(baseUrl, token)
+        // No session yet: the client establishes one on its first request and
+        // re-establishes it whenever prh forgets, which needs nothing from
+        // the user because the device secret is persisted.
+        client = PrhClient(baseUrl, deviceId, deviceSecret)
 
         bridge.startRelay { reply ->
             Log.i(TAG, "reply from watch via PKJS: ${reply.eventId} ${reply.action}")
@@ -125,6 +138,35 @@ class PrhService : Service() {
         }
 
         pollJob = scope.launch { pollLoop() }
+        heartbeatJob = scope.launch { heartbeatLoop() }
+    }
+
+    /**
+     * Keeps the session alive and, more importantly, notices when it dies.
+     *
+     * The poll loop would eventually discover a dropped session on its own,
+     * but only when it next returns — which on a quiet day is up to a minute
+     * after prh restarted, and the discovery competes with a prompt that is
+     * already blocking the agent. Finding out on a schedule instead means the
+     * session is usually already re-established by the time it matters.
+     *
+     * [PrhClient.heartbeat] logs in again by itself on a 401, so a successful
+     * call here means "session live" and a failure means the daemon is
+     * unreachable or the pairing is gone.
+     */
+    private suspend fun heartbeatLoop() {
+        while (true) {
+            delay(HEARTBEAT_INTERVAL_MS)
+            try {
+                client.heartbeat()
+            } catch (e: PrhClient.NotPaired) {
+                // Nothing to retry: prh has forgotten this device entirely.
+                Log.e(TAG, "pairing rejected by prh; re-pair from settings", e)
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "heartbeat failed: ${e.message}")
+            }
+        }
     }
 
     private suspend fun pollLoop() {
@@ -152,6 +194,12 @@ class PrhService : Service() {
                 cursor = 0
                 PrhPrefs.setCursor(this, cursor)
                 backoff = 1000L
+            } catch (e: PrhClient.NotPaired) {
+                // prh does not know this device, so backing off and retrying
+                // would spin forever. Must be caught before IOException — it
+                // is one.
+                Log.e(TAG, "pairing rejected by prh; re-pair from settings", e)
+                return
             } catch (e: IOException) {
                 Log.w(TAG, "poll error: ${e.message}")
                 delay(backoff)
