@@ -1,0 +1,41 @@
+name: android-sdk
+description: JDK 17, Gradle caching, and the SDK packages the companion compiles against.
+
+# Duplicated verbatim between ci.yml and release.yml before this existed. The
+# only fiddly part is locating sdkmanager, which is why that is a resolve step
+# rather than a hardcoded path.
+
+inputs:
+  platform:
+    description: Android platform package
+    default: 'platforms;android-36'
+  build-tools:
+    description: Build-tools package
+    default: 'build-tools;36.0.0'
+
+runs:
+  using: composite
+  steps:
+    # AGP 9 requires 17 or newer, and the project compiles Java 17 bytecode.
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - uses: gradle/actions/setup-gradle@v4
+
+    - name: install sdk packages
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The runner image ships the SDK, but which cmdline-tools directory it
+        # lands in has moved between image versions. Take whichever exists
+        # rather than asserting `latest`.
+        sdkmanager="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort | tail -1)"
+        if [ -z "$sdkmanager" ]; then
+          echo "no sdkmanager under $ANDROID_HOME/cmdline-tools" >&2
+          exit 1
+        fi
+        echo "using $sdkmanager"
+        yes | "$sdkmanager" --licenses >/dev/null 2>&1 || true
+        "$sdkmanager" '${{ inputs.platform }}' '${{ inputs.build-tools }}'

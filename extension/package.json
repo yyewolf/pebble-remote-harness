@@ -4,7 +4,6 @@
   "description": "Approve Kilo Code prompts from a Pebble Time 2",
   "version": "0.1.0",
   "publisher": "yyewolf",
-  "private": true,
   "license": "MIT",
   "icon": "icon.png",
   "repository": {

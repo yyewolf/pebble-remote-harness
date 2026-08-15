@@ -1,0 +1,347 @@
+name: release
+
+# Tag-driven. `git tag v1.2.3 && git push --tags` builds every installable,
+# attaches them to a GitHub release, and publishes the extension.
+#
+# Nothing here commits a version bump back to the repo: the tag is the version,
+# and each build stamps it into its own manifest on the fly. A release is
+# therefore reproducible from the tag alone, and a failed run leaves no
+# half-bumped files behind to clean up.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write  # creating the release and uploading assets
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Version, derived once so five jobs cannot disagree about it.
+  # ---------------------------------------------------------------------
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      code: ${{ steps.v.outputs.code }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - id: v
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # Android wants a monotonically increasing integer, and hand-bumping
+          # one is how you end up unable to install over your own build. Derive
+          # it: 1.2.3 -> 10203. Any pre-release suffix is dropped, so 1.2.3-rc1
+          # and 1.2.3 share a code — deliberate, since only one of them is ever
+          # meant to reach a device.
+          IFS=. read -r major minor patch <<< "$version"
+          patch="${patch%%[!0-9]*}"
+          echo "code=$(( ${major:-0} * 10000 + ${minor:-0} * 100 + ${patch:-0} ))" >> "$GITHUB_OUTPUT"
+
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: report
+        run: |
+          echo "version  ${{ steps.v.outputs.version }}"
+          echo "code     ${{ steps.v.outputs.code }}"
+          echo "prerel   ${{ steps.v.outputs.prerelease }}"
+
+  # ---------------------------------------------------------------------
+  # The daemon, for every platform. Also the input to the VSIX job.
+  # ---------------------------------------------------------------------
+  daemon:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+
+      # A tag that does not pass its own tests is not a release.
+      - name: test
+        run: make api-test
+
+      - name: build
+        run: make api-cross VERSION=${{ needs.version.outputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prh-binaries
+          path: bin/release/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # One VSIX per platform, each carrying the matching prh.
+  #
+  # No win32 target. Hop 0 — the Kilo plugin talking to prh — is an AF_UNIX
+  # socket, and Node implements the local domain on Windows as named pipes
+  # only, so the extension cannot reach a daemon it just started there. The
+  # windows/amd64 binary is still released for standalone use.
+  # ---------------------------------------------------------------------
+  vsix:
+    needs: [version, daemon]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: linux-x64
+            binary: prh-linux-amd64
+          - target: linux-arm64
+            binary: prh-linux-arm64
+          # CGO is off, so the linux build is static and runs on musl as-is.
+          - target: alpine-x64
+            binary: prh-linux-amd64
+          - target: darwin-x64
+            binary: prh-darwin-amd64
+          - target: darwin-arm64
+            binary: prh-darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: prh-binaries
+          path: bin/release
+
+      - name: stamp version
+        run: |
+          npm --prefix extension version '${{ needs.version.outputs.version }}' \
+            --no-git-tag-version --allow-same-version
+
+      # Mirrors the `vsix` target in the Makefile. Done inline because the
+      # binary comes from the matrix rather than from a local `go build`.
+      - name: stage payload
+        run: |
+          set -euo pipefail
+          mkdir -p extension/bin extension/plugin
+          install -m 0755 'bin/release/${{ matrix.binary }}' extension/bin/prh
+          cp -r plugin/package.json plugin/src extension/plugin/
+          # vsce looks for the licence beside the manifest, not at the repo
+          # root, and warns on every package without it.
+          cp LICENSE extension/LICENSE
+
+      - name: install
+        working-directory: extension
+        run: npm ci
+
+      - name: package
+        working-directory: extension
+        run: npx --yes @vscode/vsce package --target '${{ matrix.target }}' --out ../dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix-${{ matrix.target }}
+          path: dist/*.vsix
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Watchapp.
+  # ---------------------------------------------------------------------
+  watchapp:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pebble-sdk
+
+      # The version lives in watchapp/package.json under the `pebble` block's
+      # sibling `version` field, which is what ends up in the .pbw manifest.
+      - name: stamp version
+        run: |
+          npm --prefix watchapp version '${{ needs.version.outputs.version }}' \
+            --no-git-tag-version --allow-same-version
+
+      - name: build
+        run: make watchapp PEBBLE=pebble
+
+      - name: collect
+        run: |
+          mkdir -p dist
+          cp watchapp/build/watchapp.pbw \
+            'dist/prh-watchapp-${{ needs.version.outputs.version }}.pbw'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watchapp
+          path: dist/*.pbw
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Android companion.
+  #
+  # This is the debug APK, which is what `make package` ships and what the
+  # docs tell you to sideload. It is signed with the well-known Android debug
+  # key, so it installs directly but cannot go to the Play Store and cannot be
+  # upgraded in place from a differently-signed build. Wiring a real keystore
+  # is a matter of adding a signingConfig and three secrets — see
+  # docs/release.md.
+  # ---------------------------------------------------------------------
+  companion:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/android-sdk
+
+      - name: assemble
+        run: make companion
+        env:
+          PRH_VERSION_NAME: ${{ needs.version.outputs.version }}
+          PRH_VERSION_CODE: ${{ needs.version.outputs.code }}
+
+      - name: collect
+        run: |
+          mkdir -p dist
+          cp companion/app/build/outputs/apk/debug/app-debug.apk \
+            'dist/prh-companion-${{ needs.version.outputs.version }}.apk'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: companion
+          path: dist/*.apk
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Kilo plugin.
+  #
+  # A tarball, for installing by hand into a Kilo setup that is not driven by
+  # the extension. The extension ships its own copy of these same files inside
+  # the VSIX, so most people never touch this asset.
+  # ---------------------------------------------------------------------
+  plugin:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: parse
+        run: node --check plugin/src/index.js
+
+      - name: pack
+        run: |
+          set -euo pipefail
+          npm --prefix plugin version '${{ needs.version.outputs.version }}' \
+            --no-git-tag-version --allow-same-version
+          mkdir -p dist
+          npm pack ./plugin --pack-destination dist
+          # npm names it after the scoped package; give it the same shape as
+          # every other asset on the release page.
+          mv dist/yyewolf-prh-plugin-*.tgz \
+            'dist/prh-kilo-plugin-${{ needs.version.outputs.version }}.tgz'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin
+          path: dist/*.tgz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # Publish. Only runs once everything above has built, so a release is never
+  # partially populated.
+  # ---------------------------------------------------------------------
+  release:
+    needs: [version, daemon, vsix, watchapp, companion, plugin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: flatten
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.vsix' -o -name '*.pbw' \
+            -o -name '*.apk' -o -name '*.tgz' -o -name 'prh-*' \) \
+            -exec cp {} dist/ \;
+          # Checksums, so someone sideloading an APK off a release page has a
+          # way to tell it is the one CI built.
+          ( cd dist && sha256sum * > SHA256SUMS )
+          ls -la dist/
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Install"
+            echo
+            echo '**VSCode extension** — pick the `.vsix` for your platform and'
+            echo '`code --install-extension <file>`. It carries the `prh` daemon'
+            echo 'and the Kilo plugin, so this is the only step on a fresh machine.'
+            echo
+            echo '**Android companion** — sideload `prh-companion-'"$VERSION"'.apk`,'
+            echo 'then pair by scanning the QR code from **Pebble Harness: Pair a phone**.'
+            echo
+            echo '**Watchapp** — install `prh-watchapp-'"$VERSION"'.pbw` through the'
+            echo 'Core Devices app. Built for `emery` (Pebble Time 2).'
+            echo
+            echo '**Standalone daemon** — `prh-<os>-<arch>` for running prh without'
+            echo 'VSCode; `chmod +x` it first, since release assets carry no file mode.'
+            echo 'Windows is a binary only: the extension is not released for Windows'
+            echo 'because the plugin transport is an AF_UNIX socket.'
+            echo
+            echo '`SHA256SUMS` covers every asset here.'
+          } > notes.md
+
+          gh release create "$GITHUB_REF_NAME" \
+            --repo '${{ github.repository }}' \
+            --title "$VERSION" \
+            --notes-file notes.md \
+            --generate-notes \
+            ${{ needs.version.outputs.prerelease == 'true' && '--prerelease' || '' }} \
+            dist/*
+
+  # ---------------------------------------------------------------------
+  # Marketplace. Separate from the GitHub release on purpose: the marketplace
+  # rejects a version it already has, and that must not be able to fail the
+  # release everyone else installs from.
+  # ---------------------------------------------------------------------
+  marketplace:
+    needs: [version, vsix, release]
+    runs-on: ubuntu-latest
+    if: needs.version.outputs.prerelease == 'false'
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: vsix-*
+
+      - name: publish
+        env:
+          VSCE_PAT: ${{ secrets.VSCODE_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "VSCODE_PUBLISH_TOKEN not set; skipping marketplace publish"
+            exit 0
+          fi
+          # One call with every platform package, so the marketplace sees a
+          # single version with five targets rather than five races to publish
+          # the same version number.
+          args=()
+          while IFS= read -r f; do args+=(--packagePath "$f"); done \
+            < <(find artifacts -name '*.vsix' | sort)
+          npx --yes @vscode/vsce publish "${args[@]}"

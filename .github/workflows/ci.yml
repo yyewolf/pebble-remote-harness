@@ -1,0 +1,90 @@
+name: ci
+
+# Every component builds on its own runner rather than one job running `make
+# all`: the four toolchains here (Go, Node, the Android SDK, the Pebble SDK)
+# share nothing, and a broken Pebble SDK download should not hide a Go test
+# failure behind it.
+on:
+  push:
+    # Branches only. A tag push runs release.yml, which builds all of this
+    # again on its way to producing the artifacts.
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: daemon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache-dependency-path: api/go.sum
+      - name: vet and test
+        run: make api-test
+      # Not redundant with the test job: this is what catches a build tag or a
+      # syscall that only resolves on Linux, which is otherwise found by a user
+      # on a Mac after the release is cut.
+      - name: cross-compile every released platform
+        run: make api-cross
+
+  extension:
+    name: vscode extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - name: install
+        working-directory: extension
+        run: npm ci
+      - name: compile
+        working-directory: extension
+        run: npm run compile
+
+  plugin:
+    name: kilo plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # The plugin has no build step and no dependencies — it is loaded from
+      # source by Kilo. A parse check is the whole of what CI can assert here
+      # without standing up an agent to load it.
+      - name: parse
+        run: node --check plugin/src/index.js
+
+  companion:
+    name: android companion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/android-sdk
+      # The Makefile defaults JAVA_HOME and ANDROID_HOME with `?=`, so the
+      # values setup-java and the runner image export win without an override
+      # here.
+      - name: assemble
+        run: make companion
+
+  watchapp:
+    name: pebble watchapp
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pebble-sdk
+      - name: build
+        run: make watchapp PEBBLE=pebble

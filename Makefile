@@ -1,6 +1,15 @@
-.PHONY: all api api-test extension vsix watchapp companion package fmt clean help
+.PHONY: all api api-test api-cross extension vsix watchapp companion package fmt clean help
 
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
+# Platforms the daemon is released for. CGO is off everywhere, so each of
+# these is a static binary produced by the host toolchain — no cross compiler
+# and no container per target.
+#
+# windows/amd64 is built and shipped, but only for running prh standalone: the
+# VSCode extension is not released for Windows because Hop 0 is an AF_UNIX
+# socket and Node's net module cannot speak AF_UNIX there, only named pipes.
+PRH_PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
 # Toolchains install into $HOME without root — see docs/toolchain.md.
 # Override any of these if yours live elsewhere.
@@ -14,6 +23,7 @@ export ANDROID_HOME
 help:
 	@echo "api        build the prh daemon"
 	@echo "api-test   vet and test the Go module"
+	@echo "api-cross  build the daemon for every released platform"
 	@echo "extension  compile the VSCode extension"
 	@echo "vsix       package the extension, prh binary included"
 	@echo "watchapp   build the .pbw for emery"
@@ -30,6 +40,21 @@ api:
 api-test:
 	cd api && go vet ./... && go test ./...
 
+# One binary per entry in PRH_PLATFORMS, named after its target so the whole
+# directory can be attached to a release as-is. Doubles as the cheapest
+# possible check that no platform-specific build tag has crept in.
+api-cross:
+	@mkdir -p bin/release
+	@for target in $(PRH_PLATFORMS); do \
+		os=$${target%/*}; arch=$${target#*/}; \
+		ext=""; [ "$$os" = "windows" ] && ext=".exe"; \
+		echo "  $$os/$$arch"; \
+		( cd api && CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch \
+			go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" \
+			-o ../bin/release/prh-$$os-$$arch$$ext ./cmd/prh ) || exit 1; \
+	done
+	@ls -la bin/release/
+
 extension:
 	cd extension && npm install && npm run compile
 
@@ -43,6 +68,7 @@ vsix: api extension
 	rm -rf extension/plugin
 	mkdir -p extension/plugin
 	cp -r plugin/package.json plugin/src extension/plugin/
+	cp LICENSE extension/LICENSE
 	cd extension && npx --yes @vscode/vsce package --out ../bin/
 
 watchapp:
@@ -69,6 +95,6 @@ fmt:
 
 clean:
 	rm -rf bin dist
-	rm -rf extension/out extension/bin extension/plugin
+	rm -rf extension/out extension/bin extension/plugin extension/LICENSE
 	rm -rf watchapp/build
 	cd companion && ./gradlew clean || true

@@ -1,5 +1,7 @@
 # pebble-remote-harness
 
+[![ci](https://github.com/yyewolf/pebble-remote-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/yyewolf/pebble-remote-harness/actions/workflows/ci.yml)
+
 Approve your coding agent's permission prompts from a Pebble Time 2, and get
 told when a session stops.
 
@@ -57,6 +59,7 @@ Full detail in [docs/architecture.md](docs/architecture.md).
 - [android-companion.md](docs/android-companion.md) — the companion's job, and the probe that must pass first
 - [notifications.md](docs/notifications.md) — waking a closed watchapp, and the fallbacks
 - [toolchain.md](docs/toolchain.md) — verified versions and how to install them without root
+- [release.md](docs/release.md) — how a tag becomes a release, and why there is no Windows VSIX
 
 ## Current state
 
@@ -120,6 +123,13 @@ make companion    # gradle assembleDebug  (needs JDK + Android SDK)
 ```
 
 ## Installing
+
+Grab the [latest release](https://github.com/yyewolf/pebble-remote-harness/releases/latest)
+— every asset there is built from its tag by CI, and `SHA256SUMS` covers all of
+them. Pick the `.vsix` matching your platform; it carries `prh` and the Kilo
+plugin, so it is the only step on the VSCode side.
+
+Or build the same set yourself:
 
 ```bash
 make package      # everything installable, into dist/

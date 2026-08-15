@@ -1,0 +1,46 @@
+name: pebble-sdk
+description: Install pebble-tool and the Pebble SDK, cached between runs.
+
+# Both ci.yml and release.yml build the watchapp, and the setup is four steps
+# with two things worth getting wrong (the Python floor, and the cache path),
+# so it lives here once rather than being copied.
+
+inputs:
+  tool-version:
+    description: pebble-tool version from pip
+    default: '5.0.39'
+  sdk-version:
+    description: Pebble SDK version to install
+    default: '4.33.1'
+
+runs:
+  using: composite
+  steps:
+    # pebble-tool does not run on Python 3.13+. The runner's default python is
+    # newer than that, so this pin is load-bearing, not tidiness.
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: install pebble-tool
+      shell: bash
+      run: pip install --quiet 'pebble-tool==${{ inputs.tool-version }}'
+
+    # The SDK is a ~100MB download of prebuilt ARM toolchain from Rebble's
+    # server. Caching it keeps a routine CI run off someone else's bandwidth
+    # and stops their downtime from failing our builds.
+    - name: restore sdk
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/share/pebble-sdk
+        key: pebble-sdk-${{ runner.os }}-${{ inputs.sdk-version }}
+
+    - name: install sdk
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: pebble sdk install '${{ inputs.sdk-version }}'
+
+    - name: report
+      shell: bash
+      run: pebble --version

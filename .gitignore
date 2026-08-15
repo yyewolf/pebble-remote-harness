@@ -43,6 +43,7 @@ extension/out/
 # copied in at package time by `make vsix`
 extension/bin/
 extension/plugin/
+extension/LICENSE
 
 # Pebble watchapp
 watchapp/build/

@@ -13,8 +13,12 @@ android {
         // alive, and they are an API 26 concept.
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        // Overridden from the tag by the release workflow. A local build has
+        // no tag to read, so the literals are the fallback rather than the
+        // build failing outside CI — and the code is derived, not hand-bumped,
+        // because two people editing it is how you get a store rejection.
+        versionCode = System.getenv("PRH_VERSION_CODE")?.toIntOrNull() ?: 1
+        versionName = System.getenv("PRH_VERSION_NAME") ?: "0.1.0"
     }
 
     buildTypes {
