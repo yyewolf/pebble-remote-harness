@@ -119,6 +119,27 @@ make watchapp     # pebble build   (needs the Pebble SDK)
 make companion    # gradle assembleDebug  (needs JDK + Android SDK)
 ```
 
+## Installing
+
+```bash
+make package      # everything installable, into dist/
+```
+
+| Artifact | Where it goes |
+| --- | --- |
+| `pebble-remote-harness-0.1.0.vsix` | VSCode → Extensions → *Install from VSIX* |
+| `prh-companion.apk` | `adb install -r dist/prh-companion.apk` |
+| `prh-watchapp.pbw` | `pebble install --phone <ip>`, or the Pebble app |
+| `prh` | standalone daemon; only needed to run without VSCode |
+
+The VSIX carries the `prh` binary and the Kilo plugin, so installing it is the
+only step on the VSCode side. The plugin is still **not** installed silently —
+run *Pebble Harness: Install Kilo plugin*, which states plainly that it loads
+into every Kilo session on the machine.
+
+Then pair: *Pebble Harness: Pair a phone*, or `prh pair` for the same URL on
+the command line.
+
 ## Security
 
 Full model in [docs/plugin.md](docs/plugin.md). The short version:
@@ -132,10 +153,13 @@ Full model in [docs/plugin.md](docs/plugin.md). The short version:
   can already read `KILO_SERVER_PASSWORD` out of `/proc`. We do not pretend
   otherwise, and we do not add secrets that would only be protected by the
   same permissions.
-- **The LAN hop is the weak link.** Plaintext HTTP carrying command lines and
-  file paths. Off-LAN, put it behind Tailscale — do not port-forward it. The
-  intended fix is a pinned self-signed certificate distributed via the pairing
-  QR.
+- **The LAN hop is TLS with a pinned self-signed certificate.** The pairing
+  code carries both a one-time enrolment key and the certificate's public-key
+  fingerprint, so the phone learns which machine to trust over a channel an
+  attacker on the LAN cannot reach. Every request after that is HMAC-signed
+  against a session key, with a dated, nonced canonical string so a captured
+  request cannot be replayed. Off-LAN, still put it behind Tailscale rather
+  than port-forwarding it.
 - Decisions carry a nonce so a retry cannot become a second approval, and a
   timeout leaves a prompt pending rather than approving it.
 
