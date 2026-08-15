@@ -24,6 +24,15 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:usesCleartextTraffic="true">
+        <!--
+          Still true, and it should not be.
+
+          prh serves TLS now and the companion pins its key, so the only thing
+          this still permits is the pre-TLS fallback: a device paired from an
+          older daemon whose stored base URL is http://. Once you have re-paired
+          every phone, set this to false — it is the flag that stops an
+          accidental plaintext connection from silently working.
+        -->
 
         <activity
             android:name=".SettingsActivity"

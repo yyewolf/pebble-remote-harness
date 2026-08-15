@@ -30,6 +30,10 @@ Trust the first column; re-check the second before relying on it.
 | Question replies (`choice`/`text`) | **not wired** — v2-only API, refuses |
 | Extension's detect/install of the plugin | **known broken** — see `plugin.md` |
 | Signed requests: replay, skew, retarget, tamper | **tested** |
+| TLS pin matches across Go, the wire, and the QR | **tested end to end** |
+| Pin survives a certificate reissue | **tested** |
+| Full flow (pair → enrol → login → poll) over TLS | **tested end to end** |
+| Android verifying this certificate | **not tested on hardware** |
 | Pairing window gates enrolment, closes after one device | **tested end to end** |
 | Sealed enrolment: capture yields nothing usable | **tested end to end** |
 | Admin routes absent from the TCP listener | **tested** |
@@ -139,8 +143,11 @@ the other's upstream working.
   translation, ring-buffer eviction, the `410` cursor path, and the whole Hop 1
   auth surface. Nothing covers the plugin's decision-safety rules or the
   companion, and both would repay it.
-- **TLS on Hop 1.** Prompt bodies are command lines in plaintext. The intended
-  fix is a self-signed cert with its fingerprint in the pairing QR.
+- **The companion has never spoken TLS on real hardware.** The pin recipe is
+  verified byte-for-byte against an independent client, but Conscrypt is not
+  BoringSSL-via-Go, and `usesCleartextTraffic` is still `true` in the manifest
+  for devices paired before TLS. Flip it to `false` once every phone has
+  re-paired.
 - **The OpenAPI spec is not vendored.** Regenerate it with the snippet at the
   end of `kilo-integration.md` when you need a shape that is not documented.
 
@@ -209,6 +216,14 @@ adb shell am broadcast -a com.getpebble.action.app.START \
 - The session wrap and the pairing wrap share a recipe and differ only in
   their HKDF `info` string. Reusing one string for both would let a blob sealed
   for one purpose be opened as the other.
+- Pin the **key**, not the certificate. Hashing the whole certificate ties the
+  pin to the expiry date and forces every phone to re-pair on reissue.
+- Ed25519 makes a smaller certificate and is the wrong choice: Android cannot
+  verify it at `minSdk 26`. The QR carries a fixed-size hash either way, so
+  there is nothing to gain.
+- Node's global `fetch` is undici and ignores `agent`; `rejectUnauthorized`
+  has to go through `https.request` or the handshake fails silently and every
+  health check reports the daemon dead.
 - Subcommands come first: `prh pair -config X`, not `prh -config X pair`. The
   latter starts the daemon and fails with "another prh is already running",
   which reads like a bug and is not.

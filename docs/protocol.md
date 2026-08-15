@@ -110,9 +110,46 @@ Reports what was applied, so `prh` can stop retrying and tell the watch.
 // status: applied | rejected | expired | unknown_request
 ```
 
-## Hop 1 — `prh` ↔ companion (JSON/HTTP)
+## Hop 1 — `prh` ↔ companion (JSON over HTTPS)
 
-Default bind `0.0.0.0:8477`. Plaintext HTTP on a LAN; see Security.
+Default bind `0.0.0.0:8477`, **TLS with a self-signed certificate**. There is
+no CA and no hostname check: the companion pins the server's public key, having
+learned it from the pairing QR.
+
+### TLS
+
+prh generates an **ECDSA P-256** certificate on first start, at `cert_path` /
+`key_path` beside the config, and serves TLS 1.2+.
+
+P-256 rather than Ed25519 despite the smaller certificate: the companion
+targets `minSdk 26`, and Android's TLS stack cannot verify Ed25519
+certificates that far back — the handshake simply fails on the phone. The size
+argument is void anyway, because what travels in the QR is a 32-byte hash,
+identical for either algorithm.
+
+The pin is:
+
+```
+base64url( SHA-256( DER SubjectPublicKeyInfo ) )
+```
+
+which is exactly `PublicKey.getEncoded()` on Android and
+`cert.RawSubjectPublicKeyInfo` in Go — the two sides never have to parse each
+other's certificate format.
+
+**Pin the key, not the certificate.** Two things follow, and both are why:
+
+- prh can reissue the certificate — new SANs, longer validity — and every
+  paired phone keeps working, as long as the key file survives. Deleting
+  `key.pem` is what forces a re-pair; deleting `cert.pem` is harmless.
+- the daemon's address can change with DHCP and nothing cares, because nobody
+  is matching a hostname against it.
+
+The client side is a `TrustManager` that ignores the chain and compares the
+pin, plus a permissive `HostnameVerifier`. Disabling hostname verification is
+normally how people accidentally accept any server; it is safe here **only**
+because the pin is the identity check. The two are a pair — removing one means
+restoring the other in the same commit.
 
 ### Authentication
 
@@ -147,15 +184,20 @@ Arm a window from the editor (**Pebble Harness: Pair**) or the CLI:
 $ prh pair -ttl 120
 Pairing open for 120 seconds. In the companion app, scan or enter:
 
-  prh://192.168.1.10:8477?k=NkmADdvpCgeF3W4HUq_7ZQgvbUYmBlGDvj9EQKI24k4
+  prh://192.168.1.10:8477?k=NkmADdvpCgeF3W4HUq_7ZQgvbUYmBlGDvj9EQKI24k4&f=_ieyxg5iIuaUj7lrMjDTO4I1zBprGh9HSzwUOlR7UkY
 
 The window closes as soon as one device enrols.
 ```
 
-`k` is a freshly generated 32-byte **pairing key**, not the passphrase. It
-reaches the phone by screen-to-camera — a channel nothing on the network can
-touch — and it is single-use: the window shuts the moment one device enrols,
-and on expiry regardless.
+`k` is a freshly generated 32-byte **pairing key**, not the passphrase, and `f`
+is prh's **TLS pin**. Both reach the phone by screen-to-camera — a channel
+nothing on the network can touch — which is what makes the code a root of
+trust rather than a convenience. `k` is single-use: the window shuts the moment
+one device enrols, and on expiry regardless. `f` is long-lived and stored.
+
+The presence of `f` also selects the scheme. A code carrying it means `https`,
+and the phone does **not** fall back to `http` if the handshake fails — falling
+back is precisely the downgrade an attacker would induce.
 
 Without an open window, every registration is refused with `403`.
 
@@ -466,13 +508,18 @@ the innermost one. Full threat model in `plugin.md`.
   TTL.
 - `prh` binds `0.0.0.0` by default because the phone must reach it. Narrow
   this to the LAN interface if the host is multi-homed.
-- **Traffic is still plaintext HTTP, and envelope bodies are command lines and
-  file paths.** Signing authenticates requests; it does not encrypt them. An
-  attacker on the LAN cannot forge or replay an approval, but can still *read*
-  what the agent proposed. That is now the weakest link. LAN-trust only;
-  off-LAN, put it behind Tailscale rather than port-forwarding. The intended
-  fix is a self-signed certificate whose fingerprint travels in the pairing QR,
-  so the companion can pin it without a CA.
+- **Traffic is encrypted.** TLS 1.2+ with a self-signed certificate whose key
+  the companion pins from the pairing QR. Envelope bodies — command lines and
+  file paths — are no longer readable on the wire, and there is no CA to
+  mis-issue against.
+- Signing is kept *on top of* TLS rather than replaced by it. They answer
+  different questions: TLS says the channel is private and leads to the right
+  machine, the signature says this specific request came from an enrolled
+  device and has not been replayed. The signature also survives a mistake in
+  the hand-rolled pinning code, which is exactly the sort of thing worth
+  double-covering.
+- Off-LAN, still put it behind Tailscale rather than port-forwarding. TLS makes
+  exposure survivable, not advisable.
 
 ### Secrets at rest
 
