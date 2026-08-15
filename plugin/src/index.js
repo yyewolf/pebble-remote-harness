@@ -23,6 +23,14 @@ const PLUGIN_VERSION = "0.1.0"
 // correct: a slow prh must never block a coding turn.
 const QUEUE_MAX = 64
 
+// Applied-decision nonces retained for idempotency. Large enough that a
+// redelivery can never outlive its entry in practice, small enough that a
+// window open for days does not accumulate a set without bound.
+const MAX_SEEN_NONCES = 512
+
+// messageID -> role entries retained. Bounds the same way.
+const MAX_MESSAGE_ROLES = 256
+
 /**
  * Mirrors config.DefaultSocketPath in api/internal/config. The plugin is
  * loaded by Kilo, not by us, so it cannot be passed the path — both sides
@@ -89,6 +97,10 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
     stopped: false,
     // Bounded uplink queue. Drops on overflow; never blocks the agent.
     queue: [],
+    // messageID -> role ("user" | "assistant"). message.part.updated carries
+    // a part with a messageID but no role, so we track message.updated to
+    // know whether a text part is the user's prompt or the agent's reply.
+    messageRoles: new Map(),
   }
 
   async function hello() {
@@ -117,14 +129,43 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
     }
   }
 
+  // Conversation content. Everything else is a prompt or a lifecycle change
+  // that the watch is waiting on, and must never be dropped to make room.
+  const isChatter = (event) => event.kind === "message"
+
   // Fire-and-forget POST /plugin/v1/events with a bounded queue that drops
   // on overflow. Never await this on the agent's path: a slow prh must not
   // become a stalled turn.
   function report(event) {
     if (!state.upstreamId) return
+
+    // Supersede a queued update for the same part. The agent re-sends a part
+    // every few tokens and each report carries the *accumulated* text, so an
+    // older entry for that part is strictly redundant — collapsing them turns
+    // hundreds of queued updates into one and keeps a streaming reply from
+    // filling the queue at all.
+    if (isChatter(event) && event.msg_part_id) {
+      const at = state.queue.findIndex(
+        (q) => isChatter(q) && q.msg_part_id === event.msg_part_id,
+      )
+      if (at >= 0) {
+        state.queue[at] = event
+        flush()
+        return
+      }
+    }
+
     if (state.queue.length >= QUEUE_MAX) {
-      // Drop the oldest to make room; newest events are more relevant.
-      state.queue.shift()
+      // Drop the oldest *conversation* event to make room. Dropping blindly
+      // by age would let a streaming reply evict the permission request behind
+      // it — the prompt would never reach prh, and the watch would never buzz
+      // for the approval this whole project exists to deliver.
+      const at = state.queue.findIndex(isChatter)
+      if (at >= 0) {
+        state.queue.splice(at, 1)
+      } else {
+        state.queue.shift()
+      }
     }
     state.queue.push(event)
     flush()
@@ -139,14 +180,61 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
       .catch(() => {
         // Fail open: re-queue up to a handful, drop the rest. A dead prh
         // should not accumulate an unbounded backlog.
-        if (state.queue.length < 8) {
-          state.queue.unshift(...batch.slice(0, 8 - state.queue.length))
+        //
+        // Prompts go back before conversation: if only a few events survive a
+        // failed flush, they should be the ones somebody is waiting on.
+        const room = 8 - state.queue.length
+        if (room > 0) {
+          const keep = batch
+            .filter((e) => !isChatter(e))
+            .concat(batch.filter(isChatter))
+            .slice(0, room)
+          state.queue.unshift(...keep)
         }
       })
       .finally(() => {
         flushing = false
         if (state.queue.length > 0) flush()
       })
+  }
+
+  /**
+   * Records a nonce as applied, bounding the set so a window left open for
+   * days does not grow it without limit. Insertion order is oldest-first, so
+   * the first key is the one to drop.
+   */
+  function rememberNonce(nonce) {
+    state.seenNonces.add(nonce)
+    if (state.seenNonces.size > MAX_SEEN_NONCES) {
+      state.seenNonces.delete(state.seenNonces.values().next().value)
+    }
+  }
+
+  /**
+   * Renders a part as the text the phone shows.
+   *
+   * Only text and reasoning parts carry `.text`. A tool part carries `tool`
+   * and a `state` whose shape depends on status — reading `part.text` off one
+   * yields undefined, which is why tool calls showed up in the conversation as
+   * an empty row with a label and nothing else. `state.title` is Kilo's own
+   * one-line summary (the command, the file path); the input is the fallback
+   * for a call that has not produced a title yet.
+   */
+  function partText(part) {
+    if (typeof part.text === "string" && part.text !== "") return part.text
+
+    if (part.type === "tool") {
+      const st = part.state || {}
+      const label = st.title || part.tool || "tool"
+      if (st.status === "error" && st.error) return `${label}\n${st.error}`
+      if (st.status === "completed" && st.output) return `${label}\n${st.output}`
+      if (st.status === "running" || st.status === "pending") return `${label}…`
+      return label
+    }
+
+    // step-start, snapshot and friends have nothing to show. Returning "" lets
+    // prh keep the part as a positional marker without rendering a blank row.
+    return ""
   }
 
   /**
@@ -163,7 +251,7 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
       return "expired" // a timeout leaves the prompt pending, never approves
     }
 
-    state.seenNonces.add(decision.nonce)
+    rememberNonce(decision.nonce)
     state.pending.delete(decision.request_id)
 
     // Apply via `client`. There is deliberately no branch that calls
@@ -223,6 +311,52 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
     }
   }
 
+  /**
+   * Applies a prompt decision: sends text into a session as a new turn.
+   *
+   * This is the "reply in sessions" affordance. The phone sends text; prh
+   * queues a kind:"prompt" decision; the plugin calls Kilo's prompt_async,
+   * which starts a new turn in that session. prh never holds credentials, so
+   * it cannot send the text itself — same inversion as permission replies.
+   *
+   * `client.promptAsync` is on the v1 SDK the plugin is handed. Its body
+   * takes `parts: [{ type: "text", text }]`; we send exactly one text part.
+   * Returns 204 on success.
+   */
+  async function applyPrompt(decision) {
+    if (!decision.session_id || !decision.text) return "rejected"
+
+    // Same idempotency guard the permission path has. Without it a redelivered
+    // decision — a dropped ack, a poll that resumed from a stale cursor —
+    // injects the user's message into the session a second time, and an agent
+    // that has already started acting on it begins again.
+    if (state.seenNonces.has(decision.nonce)) return "applied"
+    rememberNonce(decision.nonce)
+
+    try {
+      // `client.session.promptAsync`, not `client.promptAsync`.
+      //
+      // The v1 KiloClient exposes exactly one method at the top level
+      // (postSessionIdPermissionsPermissionId); everything else hangs off a
+      // namespace — session, config, file, and so on. Calling the bare name
+      // throws a TypeError, which the catch below turns into "rejected": the
+      // ack says the plugin refused, nothing is logged, and the message the
+      // user typed on their phone disappears without a trace. That is the
+      // exact failure the permission path documents above; do not re-flatten
+      // this call without checking @kilocode/sdk first.
+      const res = await client.session.promptAsync({
+        path: { id: decision.session_id },
+        body: { parts: [{ type: "text", text: decision.text }] },
+      })
+      // hey-api clients resolve with {data, error} rather than throwing, so a
+      // 404 for a deleted session arrives here, not in the catch.
+      if (res && res.error) return "rejected"
+      return "applied"
+    } catch {
+      return "rejected"
+    }
+  }
+
   // Long-poll GET /plugin/v1/decisions, apply each decision, POST
   // /plugin/v1/ack with the result, reconnect with backoff. Verified in
   // Kilo 7.4.22: a plugin can hold a background loop that keeps running
@@ -273,7 +407,12 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
         backoff = 1000 // reset on success
 
         for (const dec of json.decisions || []) {
-          const result = await apply(dec)
+          let result
+          if (dec.kind === "prompt") {
+            result = await applyPrompt(dec)
+          } else {
+            result = await apply(dec)
+          }
           await post("/plugin/v1/ack", {
             upstream_id: state.upstreamId,
             id: dec.id,
@@ -362,6 +501,109 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
               description: p.error,
             })
             break
+
+          // Conversation content. The agent or user is saying something; the
+          // phone shows it for context. message.part.updated carries the
+          // accumulated part text in `part.text` plus an optional `delta`; we
+          // forward the whole part so the phone's view is always current
+          // without a streaming protocol.
+          case "message.part.updated": {
+            const part = p.part || {}
+            if (!part.sessionID || !part.id) break
+            const text = partText(part)
+            // A part with nothing to show is not worth a round trip. Dropping
+            // it here keeps step-start markers and empty tool stubs out of the
+            // phone's view and off the uplink entirely.
+            if (text === "") break
+            const role = state.messageRoles.get(part.messageID) || "assistant"
+            report({
+              kind: "message",
+              session_id: part.sessionID,
+              msg_role: role,
+              msg_part_id: part.id,
+              msg_text: text,
+              msg_kind: part.type || "text",
+              msg_time_ms: (part.time && (part.time.start || part.time.end)) || Date.now(),
+            })
+            break
+          }
+
+          // A part the agent retracted. Reported as an empty message so prh
+          // replaces the entry rather than leaving output on the phone that
+          // the session no longer contains.
+          case "message.part.removed": {
+            if (!p.sessionID || !p.partID) break
+            report({
+              kind: "message",
+              session_id: p.sessionID,
+              msg_part_id: p.partID,
+              msg_text: "",
+              msg_kind: "removed",
+              msg_time_ms: Date.now(),
+            })
+            break
+          }
+
+          // Track messageID -> role so message.part.updated knows whether a
+          // part is the user's prompt or the agent's reply. message.updated
+          // carries the full Message struct with role and id.
+          case "message.updated": {
+            const info = p.info || {}
+            if (info.id) {
+              state.messageRoles.set(info.id, info.role || "assistant")
+              // Bound the map so long sessions don't grow it forever.
+              if (state.messageRoles.size > MAX_MESSAGE_ROLES) {
+                const firstKey = state.messageRoles.keys().next().value
+                state.messageRoles.delete(firstKey)
+              }
+            }
+            break
+          }
+
+          case "message.removed": {
+            if (p.messageID) state.messageRoles.delete(p.messageID)
+            break
+          }
+
+          // Session lifecycle. Lets prh build a session registry from
+          // events rather than polling GET /session, so it needs no
+          // credentials. The `info` field is Kilo's Session struct.
+          case "session.created":
+          case "session.updated": {
+            const info = p.info || {}
+            report({
+              kind: event.type, // "session.created" | "session.updated"
+              session_id: info.id || "",
+              session_title: info.title || "",
+              session_dir: info.directory || "",
+              session_updated_ms: info.time ? (info.time.updated || Date.now()) : Date.now(),
+            })
+            break
+          }
+
+          case "session.deleted": {
+            const info = p.info || {}
+            report({
+              kind: "session.deleted",
+              session_id: info.id || "",
+            })
+            break
+          }
+
+          case "session.status": {
+            if (!p.sessionID) break
+            const status = p.status || {}
+            report({
+              kind: "session.status",
+              session_id: p.sessionID,
+              session_status: status.type || "unknown",
+              // Kilo's status event carries no timestamp, but a status change
+              // *is* activity: without this the session never moves in a list
+              // sorted by recency.
+              session_updated_ms: Date.now(),
+            })
+            break
+          }
         }
       } catch {
         // Swallowed on purpose. See rule 1.
