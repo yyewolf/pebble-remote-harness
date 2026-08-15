@@ -40,6 +40,9 @@ extension:
 vsix: api extension
 	mkdir -p extension/bin
 	cp bin/prh extension/bin/prh
+	rm -rf extension/plugin
+	mkdir -p extension/plugin
+	cp -r plugin/package.json plugin/src extension/plugin/
 	cd extension && npx --yes @vscode/vsce package --out ../bin/
 
 watchapp:

@@ -27,13 +27,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('prh.setPassword', () => setPassword()),
     vscode.commands.registerCommand('prh.devices', () => manageDevices()),
     vscode.commands.registerCommand('prh.showLog', () => output.show()),
-    vscode.commands.registerCommand('prh.installPlugin', () => kiloPlugin.install()),
+    vscode.commands.registerCommand('prh.installPlugin',
+      () => kiloPlugin.install(context.extensionUri.fsPath)),
     vscode.commands.registerCommand('prh.removePlugin', () => kiloPlugin.remove()),
   );
 
   // Detect but never fix silently: installing the plugin affects every
   // project on the machine, so it stays a deliberate user action.
-  void kiloPlugin.detect().then((state) => kiloPlugin.promptIfNeeded(state));
+  void kiloPlugin.detect().then(
+    (state) => kiloPlugin.promptIfNeeded(state, context.extensionUri.fsPath));
 
   if (vscode.workspace.getConfiguration('prh').get<boolean>('autoStart', true)) {
     try {

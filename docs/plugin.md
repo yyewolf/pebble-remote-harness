@@ -136,9 +136,10 @@ $ kilo plugin -g @yyewolf/prh-plugin
 ```
 
 It resolves from npm only. Until the package is published, installing means
-linking the module into a global root and adding its absolute path to
-`opencode.json` by hand. `extension/src/kiloPlugin.ts` still shells out to
-`kilo plugin -g` and will therefore fail — see the note there.
+placing the module somewhere stable and adding its absolute path to
+`opencode.json`. `extension/src/kiloPlugin.ts` does exactly that and no longer
+shells out to `kilo` at all — the CLI is not involved in installing this
+plugin, so `prh.kiloBinaryPath` was removed with it.
 
 Also note `kilo plugin` has **no subcommands**: `kilo plugin list` treats
 `list` as a module name and writes `{"plugin": ["list"]}` into the local
@@ -158,12 +159,32 @@ The flow:
    projects, then installs.
 4. `Pebble Harness: Remove Kilo plugin` reverses it.
 
-Steps 1 and 3 are both wrong as implemented. Detection reads the npm
-`dependencies` map, where a local install appears as
-`"file:../../workspace/…"` and parses to a junk version, so a working install
-reports as `outdated`. Installation shells out to `kilo plugin -g`, which
-404s for an unpublished package. Fixing this means choosing: publish to npm,
-or have the extension write `opencode.json` itself.
+Steps 1 and 3 were both wrong in the first implementation, and the fix was to
+have the extension write `opencode.json` itself rather than publish to npm:
+
+- **Detection** read the npm `dependencies` map, where a local install appears
+  as `"file:../../workspace/…"` and parses to a junk version — so a working
+  install reported as `outdated` and the extension nagged people whose setup
+  was already correct. It now reads the `plugin` array in `opencode.json`, the
+  only file Kilo honours, and takes the version from the installed directory's
+  own `package.json`.
+- **Installation** shelled out to `kilo plugin -g`, which 404s for an
+  unpublished package. The plugin now ships inside the VSIX and is copied to
+  `<kilo config>/node_modules/@yyewolf/prh-plugin`, whose absolute path is
+  appended to the `plugin` array.
+
+Two things that path has to get right:
+
+- **Not under the extension directory.** That path carries the extension
+  version, so every update would strand the `opencode.json` entry pointing at
+  a directory that no longer exists.
+- **A symlink there is a development checkout**, not something to overwrite.
+  `detect` reports it as `linked` and never nags; `install` offers only to
+  register it; `remove` unregisters it but never deletes through it.
+
+`opencode.json` is the user's own config — models, providers, permissions — so
+it is read, amended and written back via a temp file and rename, never
+generated.
 
 Version is pinned by the extension, not floated. The plugin sends its protocol
 version in `hello`; `prh` rejects a mismatch loudly rather than guessing.

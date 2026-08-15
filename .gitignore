@@ -38,8 +38,9 @@ bin/
 node_modules/
 extension/out/
 *.vsix
-# prh binary copied in at package time by `make vsix`
+# copied in at package time by `make vsix`
 extension/bin/
+extension/plugin/
 
 # Pebble watchapp
 watchapp/build/
