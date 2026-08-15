@@ -33,7 +33,14 @@
       "REPLY_TEXT"
     ],
     "resources": {
-      "media": []
+      "media": [
+        {
+          "name": "LOGO",
+          "file": "images/menu_icon.png",
+          "menuIcon": true,
+          "type": "png"
+        }
+      ]
     }
   }
 }
