@@ -6,6 +6,7 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -78,7 +79,66 @@ func (s *Server) PluginHandler() http.Handler {
 	mux.HandleFunc("GET /plugin/v1/decisions", s.handlePluginDecisions)
 	mux.HandleFunc("POST /plugin/v1/ack", s.handlePluginAck)
 
+	// Admin plane. On the socket for the same reason the plugin routes are:
+	// arming enrolment must not be reachable from the network. Anyone who can
+	// open the socket is already this UID and has better options than pairing
+	// a phone.
+	mux.HandleFunc("POST /admin/v1/pairing", s.handleOpenPairing)
+	mux.HandleFunc("DELETE /admin/v1/pairing", s.handleClosePairing)
+	mux.HandleFunc("GET /admin/v1/pairing", s.handlePairingStatus)
+
 	return mux
+}
+
+// handleOpenPairing arms an enrolment window with a key the caller supplies.
+//
+// The key comes from the caller rather than being minted here because whoever
+// opens the window is also the one who has to display it: the extension puts
+// it in the QR the phone scans. Generating it here would mean handing it back
+// over the socket, which is the same secret in one more place for no gain.
+func (s *Server) handleOpenPairing(w http.ResponseWriter, r *http.Request) {
+	var req protocol.OpenPairingRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	key, err := base64.RawURLEncoding.DecodeString(req.PairingKey)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "pairing_key is not base64url")
+		return
+	}
+
+	ttl := time.Duration(req.TTLSec) * time.Second
+	if req.TTLSec <= 0 {
+		ttl = protocol.DefaultPairingTTLSec * time.Second
+	}
+
+	if err := s.devices.OpenPairing(key, ttl); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.log.Info("pairing window opened", "ttl_sec", int(ttl.Seconds()))
+
+	writeJSON(w, http.StatusOK, protocol.PairingStatus{
+		Open:      true,
+		ExpiresAt: s.devices.PairingExpiry().Unix(),
+	})
+}
+
+// handleClosePairing disarms the window early, e.g. when the user closes the
+// pairing panel.
+func (s *Server) handleClosePairing(w http.ResponseWriter, r *http.Request) {
+	s.devices.ClosePairing()
+	s.log.Info("pairing window closed")
+	writeJSON(w, http.StatusOK, protocol.PairingStatus{Open: false})
+}
+
+func (s *Server) handlePairingStatus(w http.ResponseWriter, r *http.Request) {
+	status := protocol.PairingStatus{Open: s.devices.PairingOpen()}
+	if status.Open {
+		status.ExpiresAt = s.devices.PairingExpiry().Unix()
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 // handlePluginHello registers one kilo server, keyed by (parent_pid,
@@ -183,6 +243,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Upstreams: s.hub.Upstreams(),
 		Devices:   s.devices.Count(),
 		Sessions:  s.devices.Sessions(),
+		Pairing:   s.devices.PairingOpen(),
 		// Listen lets a second window detect that the running daemon was
 		// started with settings other than its own, and warn rather than
 		// restart a daemon the other windows are using.
@@ -191,12 +252,84 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRegister trades the pairing password for a device token.
+// handleRegister enrols a device, and is the only endpoint that hands out a
+// device secret.
 //
-// Rate-limited by source IP: this is the only endpoint where an attacker can
-// guess. After maxAttempts failures within the window, the IP is locked out
-// until the oldest attempt expires.
+// Gated on an open pairing window regardless of mode. Before that gate this
+// endpoint answered at any hour to anyone holding the passphrase, which made
+// the passphrase a permanent invitation — and a passphrase leaks by many
+// routes that have nothing to do with the network: a screenshot, a clipboard,
+// somebody reading your screen.
+//
+// Two modes, dispatched on whether the request is signed. See
+// protocol.RegisterRequest for what each costs.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	pairingKey, err := s.devices.PairingKey()
+	if err != nil {
+		// 403 rather than 401: the credential may well be right, but enrolment
+		// is shut. Telling them to open a window is more useful than implying
+		// they typed it wrong.
+		writeErr(w, http.StatusForbidden, "pairing is not open; start pairing from the editor")
+		return
+	}
+
+	if r.Header.Get(protocol.HeaderSig) != "" {
+		s.registerSealed(w, r, pairingKey)
+		return
+	}
+	s.registerWithPassphrase(w, r)
+}
+
+// registerSealed enrols a device that proved it read the pairing key off the
+// screen, and returns the device secret encrypted under that key.
+//
+// No rate limiting: the pairing key is 32 random bytes, so there is nothing to
+// guess, and every forgery is refused by a constant-time HMAC comparison.
+func (s *Server) registerSealed(w http.ResponseWriter, r *http.Request, pairingKey []byte) {
+	if _, ok := s.verifySignature(w, r, func(keyID string) ([]byte, error) {
+		if keyID != protocol.PairingKeyID {
+			return nil, auth.ErrBadDevice
+		}
+		return pairingKey, nil
+	}); !ok {
+		return
+	}
+
+	var req protocol.RegisterRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Password != "" {
+		// Signing proves far more than the passphrase does, and accepting both
+		// at once would mean one of them is decorative. Refuse the ambiguity.
+		writeErr(w, http.StatusBadRequest, "a signed registration must not carry a password")
+		return
+	}
+
+	dev, wrapped, err := s.devices.RegisterSealed(req.DeviceName, req.Platform, pairingKey)
+	if err != nil {
+		s.log.Error("sealed registration failed", "err", err)
+		writeErr(w, http.StatusInternalServerError, "registration failed")
+		return
+	}
+	s.log.Info("device enrolled (sealed)", "device_id", dev.ID, "name", req.DeviceName)
+
+	writeJSON(w, http.StatusOK, protocol.RegisterResponse{
+		DeviceID:   dev.ID,
+		ServerName: s.cfg.ServerName,
+		WrapSalt:   wrapped.WrapSalt,
+		WrapNonce:  wrapped.WrapNonce,
+		WrapSecret: wrapped.WrapSecret,
+	})
+}
+
+// registerWithPassphrase is the fallback for when a code cannot be scanned.
+//
+// It sends the passphrase up and the device secret back down in the clear, so
+// it is only as safe as the transport. Kept because typing 32 random bytes is
+// not a thing anyone will do, and rate-limited by source IP because the
+// passphrase is the one user-chosen secret worth guessing at.
+func (s *Server) registerWithPassphrase(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
 
 	if s.rateLimiter.isLocked(ip) {
@@ -236,9 +369,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "registration failed")
 		return
 	}
-	s.log.Info("device registered", "device_id", dev.ID, "name", req.DeviceName)
+	s.log.Info("device enrolled (passphrase, secret sent in the clear)",
+		"device_id", dev.ID, "name", req.DeviceName)
 
-	// The only time the device secret is ever transmitted.
+	// One enrolment per window, same as the sealed path.
+	s.devices.ClosePairing()
+
 	writeJSON(w, http.StatusOK, protocol.RegisterResponse{
 		DeviceID:     dev.ID,
 		DeviceSecret: dev.Secret,

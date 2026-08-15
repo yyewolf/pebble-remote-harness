@@ -3,7 +3,10 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -13,6 +16,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/hkdf"
 
 	"github.com/yyewolf/pebble-remote-harness/api/internal/auth"
 	"github.com/yyewolf/pebble-remote-harness/api/internal/config"
@@ -66,6 +71,54 @@ func deviceSigner(t *testing.T, srv *Server, deviceID string) *signer {
 		t.Fatalf("device key: %v", err)
 	}
 	return &signer{keyID: deviceID, key: key}
+}
+
+// openPairing arms an enrolment window and returns the key, which is what the
+// QR would carry.
+func openPairing(t *testing.T, srv *Server) []byte {
+	t.Helper()
+	key, err := auth.NewPairingKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.devices.OpenPairing(key, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+// openSealedSecret is the companion's half of the pairing wrap, written from
+// the recipe in docs/protocol.md rather than by calling the sealing code, so
+// that a drift between doc and implementation fails here.
+func openSealedSecret(t *testing.T, pairingKey []byte, w *auth.WrappedSecret, deviceID string) []byte {
+	t.Helper()
+
+	dec := func(s string) []byte {
+		b, err := base64.RawURLEncoding.DecodeString(s)
+		if err != nil {
+			t.Fatalf("base64: %v", err)
+		}
+		return b
+	}
+
+	wrapKey := make([]byte, 32)
+	kdf := hkdf.New(sha256.New, pairingKey, dec(w.WrapSalt), []byte("prh-pairing-wrap-v1"))
+	if _, err := io.ReadFull(kdf, wrapKey); err != nil {
+		t.Fatalf("hkdf: %v", err)
+	}
+	block, err := aes.NewCipher(wrapKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := gcm.Open(nil, dec(w.WrapNonce), dec(w.WrapSecret), []byte(deviceID))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return out
 }
 
 func randNonce(t *testing.T) string {
@@ -152,6 +205,7 @@ func TestHandleHealth(t *testing.T) {
 
 func TestHandleRegister(t *testing.T) {
 	srv := newTestServer(t, "plain:secret")
+	openPairing(t, srv)
 
 	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
 		Password:   "secret",
@@ -175,6 +229,7 @@ func TestHandleRegister(t *testing.T) {
 
 func TestHandleRegisterBadPassword(t *testing.T) {
 	srv := newTestServer(t, "plain:secret")
+	openPairing(t, srv)
 
 	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
 		Password: "wrong",
@@ -186,6 +241,7 @@ func TestHandleRegisterBadPassword(t *testing.T) {
 
 func TestHandleRegisterUnpaired(t *testing.T) {
 	srv := newTestServer(t, "")
+	openPairing(t, srv)
 
 	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
 		Password: "anything",
@@ -541,6 +597,7 @@ func TestRegisterRateLimited(t *testing.T) {
 
 	// Use a low-threshold limiter for the test.
 	srv.rateLimiter = newRateLimiter(3, 5*time.Minute)
+	openPairing(t, srv)
 
 	for i := 0; i < 3; i++ {
 		w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
@@ -563,6 +620,7 @@ func TestRegisterRateLimited(t *testing.T) {
 func TestRegisterRateLimitResetOnSuccess(t *testing.T) {
 	srv := newTestServer(t, "plain:secret")
 	srv.rateLimiter = newRateLimiter(3, 5*time.Minute)
+	openPairing(t, srv)
 
 	// Two failures — under threshold.
 	for i := 0; i < 2; i++ {
@@ -580,6 +638,9 @@ func TestRegisterRateLimitResetOnSuccess(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
+
+	// Enrolling closed the window; reopen it to keep probing the limiter.
+	openPairing(t, srv)
 
 	// Counter is reset: two more failures should not lock out.
 	for i := 0; i < 2; i++ {
@@ -812,5 +873,198 @@ func TestRevokedDeviceLosesAccessAtOnce(t *testing.T) {
 	}
 	if w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign); w.Code != http.StatusUnauthorized {
 		t.Fatalf("after revoke: status = %d, want 401", w.Code)
+	}
+}
+
+// --- pairing window -------------------------------------------------------
+
+// The gate that turns a leaked passphrase from a permanent invitation into
+// something usable only during a window the user deliberately opened.
+func TestRegisterRefusedWhenPairingIsShut(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+
+	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+		Password: "secret", DeviceName: "Pixel", Platform: "android",
+	}, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 with the window shut", w.Code)
+	}
+	if srv.devices.Count() != 0 {
+		t.Fatal("a device enrolled with pairing shut")
+	}
+}
+
+func TestRegisterRefusedAfterTheWindowExpires(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	key, _ := auth.NewPairingKey()
+	if err := srv.devices.OpenPairing(key, -time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+		Password: "secret", DeviceName: "Pixel", Platform: "android",
+	}, nil)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+}
+
+// The sealed path: sign with the key from the QR, get the device secret back
+// encrypted. Nothing usable crosses the wire.
+func TestSealedRegistration(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	key := openPairing(t, srv)
+
+	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+		DeviceName: "Pixel 8", Platform: "android",
+	}, &signer{keyID: protocol.PairingKeyID, key: key})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+
+	var resp protocol.RegisterResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.DeviceSecret != "" {
+		t.Fatal("sealed registration returned the secret in the clear")
+	}
+	if resp.WrapSalt == "" || resp.WrapNonce == "" || resp.WrapSecret == "" {
+		t.Fatal("sealed registration returned no wrapped secret")
+	}
+
+	// And it is the secret prh actually stored.
+	secret := openSealedSecret(t, key, &auth.WrappedSecret{
+		WrapSalt: resp.WrapSalt, WrapNonce: resp.WrapNonce, WrapSecret: resp.WrapSecret,
+	}, resp.DeviceID)
+	stored, err := srv.devices.DeviceKey(resp.DeviceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(secret) != string(stored) {
+		t.Fatal("unsealed secret does not match the one prh stored")
+	}
+}
+
+func TestSealedRegistrationRejectsAWrongPairingKey(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	openPairing(t, srv)
+
+	wrong, _ := auth.NewPairingKey()
+	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+		DeviceName: "Pixel", Platform: "android",
+	}, &signer{keyID: protocol.PairingKeyID, key: wrong})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+	if srv.devices.Count() != 0 {
+		t.Fatal("a device enrolled with the wrong pairing key")
+	}
+}
+
+// Signing proves more than the passphrase does; accepting both would make one
+// of them decorative.
+func TestSealedRegistrationRejectsAPassword(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	key := openPairing(t, srv)
+
+	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
+		Password: "secret", DeviceName: "Pixel", Platform: "android",
+	}, &signer{keyID: protocol.PairingKeyID, key: key})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+// One window, one device — in both modes.
+func TestEnrollingClosesTheWindow(t *testing.T) {
+	for _, mode := range []string{"sealed", "passphrase"} {
+		t.Run(mode, func(t *testing.T) {
+			srv := newTestServer(t, "plain:secret")
+			key := openPairing(t, srv)
+
+			req := protocol.RegisterRequest{DeviceName: "first", Platform: "android"}
+			var s *signer
+			if mode == "sealed" {
+				s = &signer{keyID: protocol.PairingKeyID, key: key}
+			} else {
+				req.Password = "secret"
+			}
+
+			if w := doJSON(t, srv, "POST", "/v1/register", req, s); w.Code != http.StatusOK {
+				t.Fatalf("first enrolment: status = %d, body %s", w.Code, w.Body.String())
+			}
+			if srv.devices.PairingOpen() {
+				t.Fatal("window stayed open after a device enrolled")
+			}
+
+			// A second phone needs a second deliberate act.
+			req.DeviceName = "second"
+			if w := doJSON(t, srv, "POST", "/v1/register", req, s); w.Code != http.StatusForbidden {
+				t.Fatalf("second enrolment: status = %d, want 403", w.Code)
+			}
+			if n := srv.devices.Count(); n != 1 {
+				t.Fatalf("devices = %d, want 1", n)
+			}
+		})
+	}
+}
+
+// --- admin plane ----------------------------------------------------------
+
+// Arming enrolment must not be reachable by the people enrolment defends
+// against.
+func TestPairingAdminRoutesAreNotOnTheNetwork(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+
+	for _, method := range []string{"POST", "DELETE", "GET"} {
+		req := httptest.NewRequest(method, "/admin/v1/pairing", nil)
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%s /admin/v1/pairing on the TCP mux = %d, want 404", method, w.Code)
+		}
+	}
+}
+
+func TestAdminPairingOpenCloseStatus(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	key, _ := auth.NewPairingKey()
+
+	w := doPluginJSON(t, srv, "POST", "/admin/v1/pairing", protocol.OpenPairingRequest{
+		PairingKey: base64.RawURLEncoding.EncodeToString(key),
+		TTLSec:     60,
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("open: status = %d, body %s", w.Code, w.Body.String())
+	}
+	if !srv.devices.PairingOpen() {
+		t.Fatal("window did not open")
+	}
+
+	w = doPluginJSON(t, srv, "GET", "/admin/v1/pairing", nil)
+	var st protocol.PairingStatus
+	json.Unmarshal(w.Body.Bytes(), &st)
+	if !st.Open || st.ExpiresAt == 0 {
+		t.Fatalf("status = %+v, want open with an expiry", st)
+	}
+
+	w = doPluginJSON(t, srv, "DELETE", "/admin/v1/pairing", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("close: status = %d", w.Code)
+	}
+	if srv.devices.PairingOpen() {
+		t.Fatal("window did not close")
+	}
+}
+
+// A weak pairing key would undo the whole scheme, so it is refused at the door.
+func TestAdminPairingRejectsAShortKey(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	w := doPluginJSON(t, srv, "POST", "/admin/v1/pairing", protocol.OpenPairingRequest{
+		PairingKey: base64.RawURLEncoding.EncodeToString(make([]byte, 8)),
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
 	}
 }

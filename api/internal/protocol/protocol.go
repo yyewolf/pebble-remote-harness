@@ -146,22 +146,70 @@ const NonceMinLen = 16
 // case the heartbeat exists to detect and repair.
 const SessionTTLSec = 12 * 3600
 
-// RegisterRequest trades the shared passphrase for a per-device secret. This
-// is the only request that carries the passphrase, and the only one that is
-// not signed — there is nothing to sign with yet.
+// PairingKeyID is the literal X-Prh-Key value on a sealed registration. The
+// pairing key is anonymous — there is no device yet to name — so it signs
+// under a fixed identifier rather than an issued one.
+const PairingKeyID = "pair"
+
+// DefaultPairingTTLSec is how long a pairing window stays armed. Long enough
+// to scan a code and switch apps, short enough that an unattended window is
+// not a standing invitation.
+const DefaultPairingTTLSec = 120
+
+// RegisterRequest enrols a device. Two modes, and the difference matters:
+//
+//   - **sealed** (preferred): the request is signed with the pairing key from
+//     the QR, Password is empty, and the device secret comes back encrypted.
+//     Nothing usable crosses the wire, so capturing the exchange gains
+//     nothing.
+//   - **passphrase** (fallback, for when a code cannot be scanned): Password
+//     carries the pairing passphrase and the secret comes back in the clear.
+//     Anyone who can read the traffic gets both. Only safe on a transport you
+//     trust.
+//
+// Both modes require an open pairing window.
 type RegisterRequest struct {
-	Password   string `json:"password"`
+	// Password is empty in sealed mode.
+	Password   string `json:"password,omitempty"`
 	DeviceName string `json:"device_name"`
 	Platform   string `json:"platform"`
 }
 
-// RegisterResponse hands over the device secret. It is returned exactly once
-// and cannot be recovered afterwards; a device that loses it must re-pair with
-// the passphrase.
+// RegisterResponse hands over the device secret, once and only once. A device
+// that loses it must enrol again through a new pairing window.
+//
+// In sealed mode DeviceSecret is empty and the Wrap* fields carry it instead:
+//
+//	wrapKey      = HKDF-SHA256(pairingKey, salt=WrapSalt, info="prh-pairing-wrap-v1")
+//	deviceSecret = AES-256-GCM-Open(wrapKey, WrapNonce, WrapSecret, aad=DeviceID)
+//
+// In passphrase mode DeviceSecret is populated and the Wrap* fields are empty.
 type RegisterResponse struct {
-	DeviceID     string `json:"device_id"`
-	DeviceSecret string `json:"device_secret"` // base64url, 32 bytes
-	ServerName   string `json:"server_name"`
+	DeviceID   string `json:"device_id"`
+	ServerName string `json:"server_name"`
+
+	// Passphrase mode only: base64url, 32 bytes, in the clear.
+	DeviceSecret string `json:"device_secret,omitempty"`
+
+	// Sealed mode only.
+	WrapSalt   string `json:"wrap_salt,omitempty"`   // base64url, 16 bytes
+	WrapNonce  string `json:"wrap_nonce,omitempty"`  // base64url, 12 bytes
+	WrapSecret string `json:"wrap_secret,omitempty"` // base64url, sealed 32 bytes
+}
+
+// -- admin plane, served only on the unix socket -----------------------------
+
+// OpenPairingRequest arms a pairing window. It travels over the unix socket
+// and never the network: an endpoint that opens enrolment must not be
+// reachable by the people enrolment is defending against.
+type OpenPairingRequest struct {
+	PairingKey string `json:"pairing_key"` // base64url, >= 32 bytes
+	TTLSec     int    `json:"ttl_sec,omitempty"`
+}
+
+type PairingStatus struct {
+	Open      bool  `json:"open"`
+	ExpiresAt int64 `json:"expires_at,omitempty"` // unix seconds
 }
 
 // LoginRequest asks for a session key. The body names the device; possession
@@ -229,6 +277,9 @@ type Health struct {
 	// Sessions is how many devices currently hold a valid signing key. It
 	// drops to zero on restart, which is the condition heartbeats repair.
 	Sessions int `json:"sessions"`
+	// Pairing reports whether enrolment is currently possible. The fact is
+	// safe to publish; it is what the extension's status bar shows.
+	Pairing bool `json:"pairing"`
 	Listen    string `json:"listen"`
 	Paired    bool   `json:"paired"`
 }

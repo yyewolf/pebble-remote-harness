@@ -11,16 +11,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -49,6 +54,14 @@ func run(args []string) error {
 	// not start the daemon.
 	if len(args) > 0 && args[0] == "hash-password" {
 		return hashPassword(args[1:])
+	}
+
+	// "prh pair" opens an enrolment window on the running daemon. Without it,
+	// a standalone prh — one not managed by the VSCode extension — could never
+	// enrol a phone at all, since /v1/register is gated on a window and the
+	// only way to arm one is over the socket.
+	if len(args) > 0 && args[0] == "pair" {
+		return pairCommand(args[1:])
 	}
 
 	fs := flag.NewFlagSet("prh", flag.ContinueOnError)
@@ -224,5 +237,73 @@ func hashPassword(args []string) error {
 		return err
 	}
 	fmt.Println(hash)
+	return nil
+}
+
+// pairCommand opens an enrolment window on the running daemon and prints the
+// URL a phone should scan or receive.
+//
+// It talks over the unix socket rather than the network listener, which is the
+// same reason the admin routes live there: the ability to arm enrolment must
+// not be reachable by the people enrolment is defending against.
+//
+// The key is generated here and shown to the user. prh stores it only for the
+// life of the window, and never writes it down.
+func pairCommand(args []string) error {
+	fs := flag.NewFlagSet("prh pair", flag.ContinueOnError)
+	configPath := fs.String("config", defaultConfigPath(), "path to config.json")
+	ttl := fs.Int("ttl", protocol.DefaultPairingTTLSec, "seconds the window stays open")
+	host := fs.String("host", "", "address the phone should connect to (default: the configured bind address)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	key, err := auth.NewPairingKey()
+	if err != nil {
+		return err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(key)
+
+	body, err := json.Marshal(protocol.OpenPairingRequest{PairingKey: encoded, TTLSec: *ttl})
+	if err != nil {
+		return err
+	}
+
+	// Per-request socketPath, not a shared transport: this is a one-shot call
+	// and the daemon may not be running, in which case the error should say so
+	// plainly rather than surfacing as a connection refused to localhost:80.
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", cfg.SocketPath)
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	resp, err := client.Post("http://prh/admin/v1/pairing", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("prh does not appear to be running (socket %s): %w", cfg.SocketPath, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("opening the pairing window: %s: %s", resp.Status, strings.TrimSpace(string(msg)))
+	}
+
+	addr := *host
+	if addr == "" {
+		addr = cfg.Listen
+	}
+
+	fmt.Printf("Pairing open for %d seconds. In the companion app, scan or enter:\n\n", *ttl)
+	fmt.Printf("  prh://%s?k=%s\n\n", addr, encoded)
+	fmt.Println("The window closes as soon as one device enrols.")
 	return nil
 }
