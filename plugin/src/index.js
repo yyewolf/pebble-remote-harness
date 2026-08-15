@@ -202,9 +202,19 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
 
         case "choice":
         case "text":
-          // Question replies — endpoint differs from permission replies.
-          await client.questionReply(req.sessionID, decision.request_id, decision.choice, decision.text || "")
-          return "applied"
+          // Not wired, and deliberately not faked. Question replies live on
+          // POST /question/{requestID}/reply, which exists only on the *v2*
+          // client; the v1 client the plugin is handed has no question API at
+          // all. Its body is `answers: string[][]` — one list of chosen option
+          // strings per question — which cannot be built from the bare integer
+          // `choice` this decision carries. Wiring it up means first
+          // forwarding QuestionInfo.options in the question.asked report
+          // above, then answering with strings rather than an index.
+          //
+          // Until then this refuses rather than throwing: the question stays
+          // pending in Kilo, which is what an unanswered question does
+          // without the harness. Fail open.
+          return "rejected"
 
         default:
           return "rejected"
