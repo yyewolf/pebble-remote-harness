@@ -177,16 +177,28 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
       switch (decision.action) {
         case "once":
         case "always":
-        case "reject":
-          // POST /permission/{requestID}/reply
+        case "reject": {
+          // POST /session/{id}/permissions/{permissionID}
+          //
+          // `client` is the *v1* KiloClient, whose sole permission method is
+          // this generated name. There is no `permissionReply` — calling one
+          // throws a TypeError that the catch below swallows, so the ack says
+          // "rejected", nothing is logged anywhere, and the prompt hangs
+          // pending forever. That was a real bug; do not rename this to
+          // something friendlier without checking @kilocode/sdk first.
+          //
           // "always" persists the broader pattern via always-rules in a
           // future iteration; for now the reply itself is what the agent
           // sees.
-          await client.permissionReply(decision.request_id, {
-            reply: decision.action,
-            interactive: true,
+          const res = await client.postSessionIdPermissionsPermissionId({
+            path: { id: req.sessionID, permissionID: decision.request_id },
+            body: { response: decision.action },
           })
+          // hey-api clients resolve with {data, error} instead of throwing,
+          // so a 400/404 arrives here rather than in the catch.
+          if (res && res.error) return "rejected"
           return "applied"
+        }
 
         case "choice":
         case "text":
