@@ -231,24 +231,17 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
     let backoff = 1000
 
     while (!state.stopped) {
-      // Registration lives inside the loop, not before it.
+      // Registration lives inside the loop, not once before it.
       //
-      // A dead prh leaves its socket file behind, so the existsSync() gate at
-      // the top of the plugin passes and hello() then fails with
-      // ECONNREFUSED. Registering once at load meant that instance was silent
-      // for its whole life — indistinguishable from a plugin that never
-      // loaded, since nothing logs either. Retrying costs one connect attempt
-      // per backoff tick and makes "start prh after VSCode" work.
+      // Fail open: no socket, no daemon, no harness, no noise — the user may
+      // simply not be running prh today. But both checks belong here rather
+      // than at load, because prh deletes its socket on a clean exit and
+      // recreates it on start. Gating at load meant every Kilo instance that
+      // happened to start before prh stayed dead for its entire life, and
+      // since nothing logs a plugin load, that looks exactly like a plugin
+      // that was never installed. The cost of retrying is one stat() and at
+      // most one connect() per backoff tick.
       if (!state.upstreamId) {
-        // Fail open: no daemon, no harness, no noise. Not an error, not a
-        // toast — the user may simply not be running prh today. This is a
-        // stat() per backoff tick, so an unused install costs nothing.
-        //
-        // It is checked here rather than once at load because prh removes
-        // this file on a clean exit and recreates it on start. Gating at load
-        // meant every Kilo instance that happened to start before prh stayed
-        // dead for its entire life, silently, which is indistinguishable from
-        // a plugin that never loaded.
         if (!existsSync(sock) || !(await hello())) {
           backoff = Math.min(backoff * 2, 30000)
           await sleep(backoff)
