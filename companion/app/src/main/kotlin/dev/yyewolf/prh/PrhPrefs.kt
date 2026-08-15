@@ -10,15 +10,15 @@ import androidx.security.crypto.MasterKey
  * The device secret lives in [EncryptedSharedPreferences]: it is the credential
  * that lets this phone approve shell commands, and it is the one thing that
  * must survive both a phone reboot and a prh restart. Remembering it is what
- * removes the pairing passphrase from everyday use — the passphrase is typed
- * once, at pairing, and then never again.
+ * keeps pairing a one-time act: a scanned pairing key is spent at enrolment
+ * and never needed again.
  *
  * The session key is deliberately *not* stored. It is short-lived, cheap to
  * re-obtain, and worthless once prh restarts, so writing it to disk would add
  * a persistent copy of a credential for no benefit.
  *
- * Nor is the passphrase stored. Storing it would mean holding a secret that
- * can enrol *new* devices, in order to solve a problem the device secret
+ * Nor is the pairing passphrase stored. Storing it would mean holding a secret
+ * that can enrol *new* devices, in order to solve a problem the device secret
  * already solves.
  *
  * The cursor is plain prefs — not sensitive, and read on every poll.
@@ -112,7 +112,7 @@ object PrhPrefs {
         getDeviceId(context) != null &&
             getDeviceSecret(context) != null &&
             getBaseUrl(context) != null &&
-            // An https base URL without a pin cannot connect at all, so a
-            // pairing missing one is not a pairing.
-            (getTlsPin(context) != null || getBaseUrl(context)?.startsWith("http://") == true)
+            // A base URL without a pin cannot connect: the companion only
+            // talks pinned https, so a pairing missing the pin is not one.
+            getTlsPin(context) != null
 }

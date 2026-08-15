@@ -98,7 +98,7 @@ that already protect the socket. Do not add security theatre.
 |---|---|
 | plugin → `prh` | connect to a socket in a `0700` dir; `prh` verifies peer UID |
 | `prh` → plugin | the socket path is unforgeable by other users |
-| `prh` → companion | pairing passphrase once, then a revocable device secret that only ever signs |
+| `prh` → companion | a scanned pairing key at enrolment, then a revocable device secret that only ever signs, all over pinned TLS |
 | `prh` → Kilo | **none — deliberately impossible** |
 
 ## Installation lifecycle
@@ -233,9 +233,12 @@ line of defence:
 - **A compromised `prh` can approve prompts.** Not arbitrary code execution,
   but it can say yes to something the agent proposed. This is inherent to
   remote approval and is the reason the reply path is scoped so narrowly.
-- **The `/v1` LAN surface is plaintext HTTP.** Prompt bodies are command lines
-  and file paths. See `protocol.md`; the fix is a pinned self-signed
-  certificate distributed through the pairing QR, or Tailscale.
+- **The `/v1` LAN surface is TLS with a pinned self-signed certificate.** The
+  pairing QR carries both a one-time enrolment key and the certificate's
+  public-key fingerprint, so the phone learns which machine to trust over a
+  channel an attacker on the LAN cannot reach. Prompt bodies are command lines
+  and file paths, which is why the phone refuses an unpinned connection. Off-LAN,
+  still put it behind Tailscale rather than port-forwarding it.
 - **The watch displays commands.** Anyone who can see your wrist can read what
   the agent proposed.
 - **Kilo's plugin API is undocumented** and can break on upgrade. That risk

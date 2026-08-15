@@ -162,7 +162,7 @@ Three credentials, each with a different lifetime:
 | Credential | Lives | Crosses the wire | Purpose |
 |---|---|---|---|
 | pairing key | memory, for the life of one window | never — read off the screen by camera | authorise one enrolment |
-| pairing passphrase | argon2id hash in `config.json` | fallback mode only, in the clear | authorise one enrolment |
+| pairing passphrase | argon2id hash in `config.json` | legacy mode; no shipped client offers it | authorise one enrolment |
 | device secret | `devices.json` (0600) and the phone's `EncryptedSharedPreferences` | never, if enrolled with a pairing key | prove identity at login |
 | session key | memory on both sides, 12h TTL | never in the clear — wrapped at login | sign every request |
 
@@ -195,9 +195,11 @@ nothing on the network can touch — which is what makes the code a root of
 trust rather than a convenience. `k` is single-use: the window shuts the moment
 one device enrols, and on expiry regardless. `f` is long-lived and stored.
 
-The presence of `f` also selects the scheme. A code carrying it means `https`,
-and the phone does **not** fall back to `http` if the handshake fails — falling
-back is precisely the downgrade an attacker would induce.
+The presence of `f` selects the scheme: the phone talks **https** and pins the
+certificate, and refuses to connect if the handshake fails — falling back to
+`http` is precisely the downgrade an attacker would induce, so it is not even
+an option. Every current code carries `f`, and cleartext is disabled in the
+companion's manifest.
 
 Without an open window, every registration is refused with `403`.
 
@@ -226,7 +228,8 @@ deviceSecret = AES-256-GCM-Open(wrapKey, wrap_nonce, wrap_secret, aad=device_id)
 An attacker who captured this entire exchange holds a signature and a sealed
 blob, and can do nothing with either.
 
-**Passphrase** — the fallback for when a code cannot be scanned:
+**Passphrase** — the legacy mode, still accepted by prh but offered by no
+shipped client:
 
 ```jsonc
 // request
@@ -237,10 +240,10 @@ blob, and can do nothing with either.
   "server_name": "workstation" }
 ```
 
-**This mode is only as safe as the transport, which today is plaintext HTTP.**
-Both the passphrase and the device secret are readable by anyone on the path.
-It exists because typing 32 random bytes is not something anyone will do. Use
-the scanned code when you can.
+The companion no longer implements this: without a scanned code there is no TLS
+pin, and without a pin there is no way to distinguish prh from anything else
+answering on that address. The endpoint remains because it is rate-limited and
+cheap, not because anything uses it.
 
 Responses: `403` window shut or expired, `401` bad pairing key or bad password,
 `400` a signed request that also carries a password, `429` repeated passphrase
@@ -260,7 +263,7 @@ Trades the device secret for a session key. **Signed with the device secret**
 { "key_id": "key_9c1d", "wrap_salt": "<16B>", "wrap_nonce": "<12B>",
   "wrapped_key": "<sealed 32B>", "expires_at": 1765432100,
   "server_name": "workstation" }
-// 401 unknown device or bad signature — re-pair with the passphrase
+// 401 unknown device or bad signature — re-pair by scanning a fresh code
 // 400 device_id does not match the signing key
 ```
 
@@ -489,18 +492,19 @@ the innermost one. Full threat model in `plugin.md`.
 **Hop 1 (`prh` ↔ companion)** — the exposed surface.
 
 - The pairing passphrase is stored **hashed** (argon2id) in `prh` config; the
-  plaintext lives only in VSCode `SecretStorage` and crosses the wire once per
-  device.
+  plaintext lives only in VSCode `SecretStorage`. No shipped client offers
+  passphrase pairing any more, so the plaintext no longer crosses the wire at
+  all.
 - **Enrolment is gated on a pairing window** the user opens deliberately, and
   closes after one device. Before that gate, anyone who ever learned the
   passphrase — by sniffing, a screenshot, a clipboard, or reading your screen —
   could enrol at any hour.
-- With a scanned code the enrolment response is **sealed** under a key that
-  reached the phone by camera, so capturing the exchange yields nothing. The
-  typed-passphrase fallback has no such protection.
-- Passphrase registration is rate-limited; repeated failures lock out the
-  source IP. Neither login nor sealed registration is rate-limited, and neither
-  needs to be — both keys are 32 random bytes, so there is nothing to guess.
+- The enrolment response is **sealed** under a key that reached the phone by
+  camera, so capturing the exchange yields nothing.
+- Passphrase registration is rate-limited on the server for the same reason the
+  window gate exists; repeated failures lock out the source IP. Neither login
+  nor sealed registration is rate-limited, and neither needs to be — both keys
+  are 32 random bytes, so there is nothing to guess.
 - **Every other request is signed**, so no credential is replayable. See
   Authentication above for what each signed field defends against.
 - Devices are independently revocable from the extension, and revoking one

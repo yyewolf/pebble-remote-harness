@@ -114,7 +114,7 @@ Three things this taught us that static analysis had not:
 | Wake | `PebbleKit.startAppOnPebble(ctx, WATCHAPP_UUID)` on `perm` and `ques` envelopes |
 | Deliver | `PebbleKit.sendDataToPebble()` with the AppMessage dictionary from `protocol.md` |
 | Reply | `PebbleKit.registerReceivedDataHandler()` -> `POST /v1/reply` |
-| Register | Settings screen: host, port, password. Calls `/v1/register`, stores the device secret in `EncryptedSharedPreferences`; every later call is signed |
+| Register | Settings screen, driven by the scanned `prh://…?k=…&f=…` deep link. Calls `/v1/register`, stores the device secret in `EncryptedSharedPreferences`; every later call is signed |
 | Fallback | Post an Android notification when the watch is disconnected, so the prompt is not silently lost |
 
 ## Battery and lifecycle

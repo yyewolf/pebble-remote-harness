@@ -1,7 +1,8 @@
 package dev.yyewolf.prh
 
-import android.app.Activity
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -9,15 +10,19 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
-import android.view.View
-import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.core.view.setPadding
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanIntentResult
+import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -28,23 +33,49 @@ import kotlinx.coroutines.withContext
  *
  * Registration lives here rather than on the watch: typing an IP address with
  * watch buttons is not a design. The VSCode extension shows a QR encoding
- * `prh://<host>:<port>?k=<one-time pairing key>`, which arrives as a VIEW
- * intent. The older `?pw=<passphrase>` form still works and is the fallback
- * for when a code cannot be scanned, but it sends both the passphrase and the
- * device secret in the clear — see docs/protocol.md.
+ * `prh://<host>:<port>?k=<one-time pairing key>&f=<tls pin>`, which arrives as
+ * a VIEW intent. That is the only way to pair: the passphrase fallback that
+ * ran over plaintext HTTP has been removed, so there is no code path that
+ * sends a secret without the pinned-TLS protection.
  */
-class SettingsActivity : Activity() {
+class SettingsActivity : ComponentActivity() {
 
     private lateinit var hostField: EditText
     private lateinit var portField: EditText
-    private lateinit var passwordField: EditText
     private lateinit var statusText: TextView
     private lateinit var pairButton: Button
+    private lateinit var scanButton: Button
     private val scope = CoroutineScope(Dispatchers.Main)
+
+    /**
+     * Launches the in-app QR scanner. The decoded text — a `prh://` deep
+     * link — is treated exactly like a VIEW intent: parsed into the same
+     * deep-link fields `doPair` consumes. Decoding a non-`prh` string is
+     * harmless: `parseDeepLink` ignores it.
+     */
+    private val scanLauncher = registerForActivityResult(ScanContract()) { result: ScanIntentResult ->
+        val contents = result.contents
+        if (contents.isNullOrEmpty()) return@registerForActivityResult
+        // A VIEW intent's `.data` is a Uri; the scanner hands back raw text, so
+        // wrap it. Everything downstream reads scheme/host/query, which Uri
+        // parses from a string the same way Intent would.
+        applyScannedCode(Uri.parse(contents))
+    }
+
+    /**
+     * Requests CAMERA when the user taps Scan, then launches the scanner on a
+     * grant. Marshmallow-and-up runtime permissions are the only target here
+     * (minSdk 26), so there is no pre-M branch.
+     */
+    private val cameraPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) launchScanner() else {
+                Toast.makeText(this, "Camera permission needed to scan", Toast.LENGTH_SHORT).show()
+            }
+        }
 
     private var deepLinkHost: String? = null
     private var deepLinkPort: Int = -1
-    private var deepLinkPw: String? = null
 
     /**
      * The one-time pairing key from the QR, held only for this pairing attempt
@@ -55,8 +86,9 @@ class SettingsActivity : Activity() {
     /**
      * base64url SHA-256 of prh's TLS public key, from the QR's `f` parameter.
      *
-     * Its presence is what selects https. A code without it can only reach a
-     * plaintext daemon, which is the pre-TLS fallback.
+     * Its presence is what selects https. Without it the phone has no way to
+     * tell prh from anything else answering on that address, so pairing cannot
+     * proceed — there is no plaintext fallback.
      */
     private var deepLinkPin: String? = null
 
@@ -99,18 +131,8 @@ class SettingsActivity : Activity() {
             maxLines = 1
             setPadding(24, 16, 24, 16)
         }
-        val pwLabel = TextView(this).apply {
-            text = "Password (only if you cannot scan a code)"
-            textSize = 16f
-            setPadding(0, 16, 0, 8)
-        }
-        passwordField = EditText(this).apply {
-            hint = "Pairing password"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            maxLines = 1
-            setPadding(24, 16, 24, 16)
-        }
         pairButton = Button(this).apply { text = "Pair" }
+        scanButton = Button(this).apply { text = getString(R.string.scan_button) }
         statusText = TextView(this).apply {
             text = "Not paired"
             setPadding(0, 16, 0, 0)
@@ -120,15 +142,15 @@ class SettingsActivity : Activity() {
         root.addView(hostField)
         root.addView(portLabel)
         root.addView(portField)
-        root.addView(pwLabel)
-        root.addView(passwordField)
         root.addView(pairButton)
+        root.addView(scanButton)
         root.addView(statusText)
         scroll.addView(root)
         setContentView(scroll)
 
         prefill()
         pairButton.setOnClickListener { doPair() }
+        scanButton.setOnClickListener { onScanClicked() }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -141,14 +163,62 @@ class SettingsActivity : Activity() {
 
     private fun parseDeepLink(intent: Intent?) {
         val data = intent?.data ?: return
+        parsePrhUri(data)
+    }
+
+    /**
+     * Pulls host/port/key/pin out of a `prh://` URI, whether it arrived as a
+     * VIEW intent or was decoded by the in-app scanner. A non-`prh` URI is
+     * ignored, so a misread QR is harmless.
+     */
+    private fun parsePrhUri(data: Uri) {
         if (data.scheme != "prh") return
         deepLinkHost = data.host
         deepLinkPort = data.port
-        // `k` is the one-time pairing key from the QR; `pw` is the passphrase
-        // fallback for when a code cannot be scanned. Prefer `k`.
+        // `k` is the one-time pairing key from the QR; `f` is the TLS pin that
+        // selects https. Both come from the scanned code, never typed.
         deepLinkKey = data.getQueryParameter("k")
         deepLinkPin = data.getQueryParameter("f")
-        deepLinkPw = data.getQueryParameter("pw")
+    }
+
+    /**
+     * Feeds a scanned code into the same deep-link state a VIEW intent would
+     * set, then refreshes the fields. The one-time key is now in memory and
+     * `doPair` will spend it on the next tap.
+     */
+    private fun applyScannedCode(uri: Uri) {
+        parsePrhUri(uri)
+        prefill()
+        if (deepLinkKey == null) {
+            Toast.makeText(this, "That code is not a prh pairing link", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // -- scan ---------------------------------------------------------------
+
+    private fun onScanClicked() {
+        if (hasCameraPermission()) {
+            launchScanner()
+        } else {
+            cameraPermission.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    private fun hasCameraPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun launchScanner() {
+        val options = ScanOptions().apply {
+            // The pairing code is a dense base64url string; QR is the only
+            // format the editor emits, so restricting to it stops a stray 1D
+            // barcode (a receipt, a book) from being mistaken for a code.
+            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+            setPrompt(getString(R.string.scan_prompt))
+            setBeepEnabled(false)
+            setOrientationLocked(false)
+        }
+        scanLauncher.launch(options)
     }
 
     private fun prefill() {
@@ -166,17 +236,12 @@ class SettingsActivity : Activity() {
         if (PrhPrefs.isPaired(this)) {
             statusText.text = "Paired"
         }
-        // The pairing key is never shown in the password box: it is a
-        // high-entropy one-time secret that arrived out of band, and putting
-        // it in an editable text field invites it into clipboards and
-        // screenshots. It is held in memory for this one pairing attempt.
+        // The pairing key is never shown in a text field: it is a high-entropy
+        // one-time secret that arrived out of band, and putting it in an
+        // editable field invites it into clipboards and screenshots. It is
+        // held in memory for this one pairing attempt.
         if (deepLinkKey != null) {
-            passwordField.isEnabled = false
-            passwordField.setText("")
-            passwordField.hint = "Not needed — pairing code scanned"
             statusText.text = "Ready to pair with the scanned code"
-        } else {
-            deepLinkPw?.let { passwordField.setText(it) }
         }
     }
 
@@ -185,24 +250,26 @@ class SettingsActivity : Activity() {
     private fun doPair() {
         val host = hostField.text.toString().trim()
         val port = portField.text.toString().trim()
-        val pw = passwordField.text.toString()
         val key = deepLinkKey
 
         if (host.isEmpty()) {
             Toast.makeText(this, "Host required", Toast.LENGTH_SHORT).show()
             return
         }
-        if (key == null && pw.isEmpty()) {
-            Toast.makeText(this, "Scan a pairing code, or enter the passphrase", Toast.LENGTH_SHORT).show()
+        if (key == null) {
+            Toast.makeText(this, "Scan a pairing code to pair", Toast.LENGTH_SHORT).show()
             return
         }
 
         // The pin decides the scheme. There is no negotiation and no fallback:
         // trying https and dropping to http on failure is exactly the downgrade
-        // an attacker would induce.
+        // an attacker would induce — and cleartext is disabled in the manifest.
         val pin = deepLinkPin ?: PrhPrefs.getTlsPin(this)
-        val scheme = if (pin != null) "https" else "http"
-        val baseUrl = "$scheme://$host:$port"
+        if (pin == null) {
+            Toast.makeText(this, "This code has no TLS pin. Pair from the editor again.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val baseUrl = "https://$host:$port"
 
         pairButton.isEnabled = false
         statusText.text = "Pairing…"
@@ -213,19 +280,16 @@ class SettingsActivity : Activity() {
                 val deviceName = PrhPrefs.getDeviceName(this@SettingsActivity)
 
                 // Enrolment is the one exchange whose compromise hands over
-                // everything, so take the sealed path whenever a code was
-                // scanned: the key is proved by signing rather than sent, and
-                // the device secret comes back encrypted under it.
+                // everything, so take the sealed path: the key is proved by
+                // signing rather than sent, and the device secret comes back
+                // encrypted under it.
                 //
-                // What comes back either way is the device secret, which is
-                // what everything afterwards signs with — so this screen is not
+                // What comes back is the device secret, which is what
+                // everything afterwards signs with — so this screen is not
                 // needed again unless the device is revoked or prh loses its
                 // devices file.
-                val (deviceId, deviceSecret) = if (key != null) {
+                val (deviceId, deviceSecret) =
                     client.registerWithPairingKey(PrhSigning.decode(key), deviceName)
-                } else {
-                    client.registerWithPassphrase(pw, deviceName)
-                }
 
                 PrhPrefs.setBaseUrl(this@SettingsActivity, baseUrl)
                 PrhPrefs.setCredentials(this@SettingsActivity, deviceId, deviceSecret)

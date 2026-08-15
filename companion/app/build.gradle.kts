@@ -44,4 +44,16 @@ dependencies {
     // and a content provider: if it ever breaks, reimplementing it directly is
     // a day's work, not a redesign.
     implementation("com.getpebble:pebblekit:4.0.1")
+
+    // In-app QR scan for pairing. The pairing code is a `prh://` deep link,
+    // and stock camera apps only auto-open http(s): they show the unknown
+    // scheme as text and never fire a VIEW intent. So the companion scans the
+    // code itself and hands the decoded URI straight to parseDeepLink — the
+    // manifest intent filter still routes a real deep link, but pairing no
+    // longer depends on the scanner honoring a custom scheme.
+    //
+    // zxing-android-embedded over ML Kit: ML Kit pulls Google Play Services,
+    // which is not a safe assumption on the kind of device that still talks
+    // to a Pebble, and the whole point is an offline, self-contained flow.
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }

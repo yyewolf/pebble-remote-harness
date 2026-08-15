@@ -44,8 +44,8 @@ class PrhClient(
 
     /**
      * The device is not registered with this prh at all, so no amount of
-     * retrying will help — the user has to re-pair with the passphrase. Worth
-     * distinguishing from a transient failure so the UI can say something
+     * retrying will help — the user has to re-pair by scanning a fresh code.
+     * Worth distinguishing from a transient failure so the UI can say something
      * useful instead of retrying forever.
      */
     class NotPaired(message: String) : IOException(message)
@@ -73,12 +73,11 @@ class PrhClient(
     val isLoggedIn: Boolean get() = sessionKey != null
 
     /**
-     * Enrols using the one-time pairing key from the QR — the preferred path.
+     * Enrols using the one-time pairing key from the QR — the only path.
      *
      * The key is proved by signing rather than sent, and the device secret
      * comes back sealed under it, so the enrolment exchange carries nothing an
-     * eavesdropper can use. Compare [registerWithPassphrase], where both halves
-     * travel in the clear.
+     * eavesdropper can use.
      *
      * Returns the device ID and the base64url device secret.
      */
@@ -114,39 +113,6 @@ class PrhClient(
         )
         id to PrhSigning.encode(secret)
     }
-
-    /**
-     * Enrols with the pairing passphrase, for when a code cannot be scanned.
-     *
-     * Both the passphrase going up and the device secret coming back travel in
-     * the clear, so this is only as safe as the transport — which today is
-     * plaintext HTTP. Prefer [registerWithPairingKey]; this exists because
-     * typing 32 random bytes is not something anyone will do.
-     */
-    suspend fun registerWithPassphrase(password: String, deviceName: String): Pair<String, String> =
-        withContext(Dispatchers.IO) {
-            val body = JSONObject().apply {
-                put("password", password)
-                put("device_name", deviceName)
-                put("platform", "android")
-            }.toString().toByteArray()
-
-            val resp = try {
-                doJson("POST", "/v1/register", body, null)
-            } catch (e: HttpException) {
-                if (e.code == 403) {
-                    throw PairingClosed("pairing is not open on prh; start pairing from the editor")
-                }
-                throw e
-            }
-
-            val id = resp.optString("device_id", "")
-            val secret = resp.optString("device_secret", "")
-            if (id.isEmpty() || secret.isEmpty()) {
-                throw IOException("register: no device credentials in response")
-            }
-            id to secret
-        }
 
     /**
      * Obtains a session key, proving possession of the device secret by

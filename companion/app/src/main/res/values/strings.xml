@@ -4,4 +4,6 @@
     <string name="ongoing_channel">Connection</string>
     <string name="ongoing_text">Watching for prompts</string>
     <string name="alerts_channel">Prompts</string>
+    <string name="scan_button">Scan pairing code</string>
+    <string name="scan_prompt">Point the camera at the pairing code in the editor</string>
 </resources>

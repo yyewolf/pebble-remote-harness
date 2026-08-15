@@ -146,9 +146,6 @@ the other's upstream working.
   translation, ring-buffer eviction, the `410` cursor path, and the whole Hop 1
   auth surface. Nothing covers the plugin's decision-safety rules or the
   companion, and both would repay it.
-- **`usesCleartextTraffic` is still `true`** in the manifest, for devices
-  paired before TLS existed. Every phone here has now re-paired over https, so
-  this can be flipped to `false`.
 - **The OpenAPI spec is not vendored.** Regenerate it with the snippet at the
   end of `kilo-integration.md` when you need a shape that is not documented.
 

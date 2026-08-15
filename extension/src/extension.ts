@@ -3,6 +3,7 @@ import * as os from 'os';
 
 import { Daemon, DaemonState } from './daemon';
 import * as kiloPlugin from './kiloPlugin';
+import { encodeQr, renderQrSvg } from './qr';
 
 let daemon: Daemon | undefined;
 
@@ -23,7 +24,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.commands.registerCommand('prh.start', () => daemon?.start()),
     vscode.commands.registerCommand('prh.stop', () => daemon?.stop()),
-    vscode.commands.registerCommand('prh.pair', () => pair()),
+    vscode.commands.registerCommand('prh.pair', () => pair(context)),
     vscode.commands.registerCommand('prh.setPassword', () => setPassword()),
     vscode.commands.registerCommand('prh.devices', () => manageDevices()),
     vscode.commands.registerCommand('prh.showLog', () => output.show()),
@@ -78,19 +79,22 @@ function render(status: vscode.StatusBarItem, state: DaemonState): void {
  * enrols, so enrolment stops being a standing invitation to anyone who ever
  * learns the passphrase.
  */
-async function pair(): Promise<void> {
+async function pair(context: vscode.ExtensionContext): Promise<void> {
   if (!daemon) return;
 
   const cfg = vscode.workspace.getConfiguration('prh');
   const bindAddress = cfg.get<string>('bindAddress', '0.0.0.0');
   const port = daemon.currentPort;
 
-  const lanAddr = pickLanAddress(bindAddress);
-  if (!lanAddr) {
+  const lanAddr = await resolveLanAddress(bindAddress, context);
+  if (lanAddr === undefined) {
     vscode.window.showWarningMessage(
-      'prh is bound to loopback. The phone cannot reach it. Set prh.bindAddress to your LAN address.',
+      'prh has no non-loopback address for the phone to reach. Set prh.bindAddress to your LAN address.',
     );
     return;
+  }
+  if (lanAddr === null) {
+    return; // the user dismissed the picker
   }
 
   // The TLS pin travels in the same out-of-band hop as the pairing key. A
@@ -116,7 +120,7 @@ async function pair(): Promise<void> {
   }
 
   const url = `prh://${lanAddr}:${port}?k=${pairing.key}&f=${pin}`;
-  const qr = renderQrAscii(url);
+  const qr = renderQrSvg(encodeQr(url).modules);
 
   const panel = vscode.window.createWebviewPanel(
     'prh.pair',
@@ -129,7 +133,7 @@ async function pair(): Promise<void> {
 <html>
 <head><meta charset="utf-8"><style>
   body { font-family: sans-serif; padding: 24px; background: #fff; color: #000; }
-  pre { font-family: 'Courier New', monospace; font-size: 10px; line-height: 10px; }
+  svg { display: block; margin: 0 auto; }
   code { font-size: 14px; word-break: break-all; }
   .warn { color: #a00; }
 </style></head>
@@ -138,7 +142,7 @@ async function pair(): Promise<void> {
   <p>Open the Pebble Remote Harness app and scan this code within
      <strong>${ttlSec} seconds</strong>. It stops working as soon as one phone
      pairs.</p>
-  <pre>${qr}</pre>
+  ${qr}
   <p>Or enter manually:</p>
   <p><code>${url}</code></p>
   <p class="warn">This code is a one-time secret. Do not paste it anywhere but
@@ -232,22 +236,106 @@ async function manageDevices(): Promise<void> {
 
 // -- helpers --------------------------------------------------------------
 
-function pickLanAddress(bindAddress: string): string | undefined {
-  // If the bind is a specific address, use it directly.
+/** Key under which the chosen LAN interface name is remembered. */
+const PAIR_INTERFACE_KEY = 'prh.pairInterface';
+
+interface LanCandidate {
+  address: string;
+  iface: string;
+}
+
+/**
+ * Picks the address the phone will scan, prompting only when the host is
+ * multi-homed and the answer is not already remembered.
+ *
+ * Returns:
+ *   - the address as a string when one is chosen (or was remembered)
+ *   - `null` when the user dismissed the picker
+ *   - `undefined` when the host has no non-loopback address at all
+ *
+ * A specific `prh.bindAddress` is a decision already made in settings, so it
+ * is used verbatim and never prompts. The wildcard (`0.0.0.0`/`::`) is where
+ * ambiguity lives: the first non-loopback IPv4 in `os.networkInterfaces()`
+ * iteration order is essentially arbitrary, and on a multi-homed box it is
+ * usually a docker bridge or VPN that the phone cannot reach. So we rank real
+ * interfaces first, prompt when several plausible ones remain, and remember
+ * the *interface name* rather than the address — DHCP churns addresses, but
+ * the interface the user picked stays put.
+ */
+async function resolveLanAddress(
+  bindAddress: string,
+  context: vscode.ExtensionContext,
+): Promise<string | null | undefined> {
   if (bindAddress !== '0.0.0.0' && bindAddress !== '::') {
     return bindAddress;
   }
 
-  // Otherwise find the first non-loopback IPv4 address.
+  const candidates = collectLanAddresses();
+  if (candidates.length === 0) return undefined;
+  if (candidates.length === 1) return candidates[0].address;
+
+  // A remembered interface still on the list wins without a prompt.
+  const remembered = context.globalState.get<string>(PAIR_INTERFACE_KEY);
+  const rememberedCandidate = candidates.find((c) => c.iface === remembered);
+  if (rememberedCandidate) return rememberedCandidate.address;
+
+  const choice = await vscode.window.showQuickPick(
+    candidates.map((c) => ({ label: c.address, description: c.iface })),
+    {
+      title: 'Pair over which network?',
+      placeHolder: 'Pick the address your phone can reach',
+    },
+  );
+  if (!choice) return null;
+
+  const chosen = candidates.find((c) => c.address === choice.label);
+  if (chosen) {
+    await context.globalState.update(PAIR_INTERFACE_KEY, chosen.iface);
+  }
+  return choice.label;
+}
+
+/**
+ * Every non-loopback, non-link-local IPv4 address on the host, ranked so the
+ * interface the phone can actually reach sorts before the virtual plumbing.
+ */
+function collectLanAddresses(): LanCandidate[] {
+  const seen = new Set<string>();
+  const candidates: LanCandidate[] = [];
   const ifs = os.networkInterfaces();
   for (const name of Object.keys(ifs)) {
     for (const addr of ifs[name] ?? []) {
-      if (addr.family === 'IPv4' && !addr.internal) {
-        return addr.address;
-      }
+      if (addr.family !== 'IPv4' || addr.internal) continue;
+      if (isLinkLocal(addr.address)) continue;
+      if (seen.has(addr.address)) continue;
+      seen.add(addr.address);
+      candidates.push({ address: addr.address, iface: name });
     }
   }
-  return undefined;
+  candidates.sort((a, b) => rankIface(a.iface) - rankIface(b.iface));
+  return candidates;
+}
+
+/** 169.254.0.0/16 is link-local; a phone on the same LAN cannot route to it. */
+function isLinkLocal(address: string): boolean {
+  return address.startsWith('169.254.');
+}
+
+/**
+ * Rough interface ranking. Virtual plumbing — docker bridges, veth pairs, VPN
+ * tunnels, VM nets, macOS's internal awdl/llw/utun — is real IPv4 but not
+ * what the phone should scan, so it sorts last. Ethernet and wifi (`en*`,
+ * `eth*`, `wl*`, `wlan*`) sort first; everything else sits in between.
+ */
+function rankIface(name: string): number {
+  const n = name.toLowerCase();
+  if (/^(br|veth|virbr|tun|tap|utun|wg|docker|llw|awdl|vmnet|tailscale|zerotier)/.test(n)) {
+    return 2;
+  }
+  if (/^(en|eth|wl|wlan|wwan)/.test(n)) {
+    return 0;
+  }
+  return 1;
 }
 
 function generatePassphrase(): string {
@@ -258,14 +346,4 @@ function generatePassphrase(): string {
   const pick = () => words[Math.floor(Math.random() * words.length)];
   const num = () => Math.floor(Math.random() * 100);
   return `${pick()}-${pick()}-${num()}`;
-}
-
-// Simple ASCII QR placeholder. A real implementation would use a QR library,
-// but the URL is also copyable and the companion can accept manual entry.
-function renderQrAscii(url: string): string {
-  return `+----------------------------+
-|  Scan from the companion    |
-|  or paste the URL below.    |
-+----------------------------+
-  ${url}`;
 }
