@@ -52,6 +52,14 @@ class SettingsActivity : Activity() {
      */
     private var deepLinkKey: String? = null
 
+    /**
+     * base64url SHA-256 of prh's TLS public key, from the QR's `f` parameter.
+     *
+     * Its presence is what selects https. A code without it can only reach a
+     * plaintext daemon, which is the pre-TLS fallback.
+     */
+    private var deepLinkPin: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -139,6 +147,7 @@ class SettingsActivity : Activity() {
         // `k` is the one-time pairing key from the QR; `pw` is the passphrase
         // fallback for when a code cannot be scanned. Prefer `k`.
         deepLinkKey = data.getQueryParameter("k")
+        deepLinkPin = data.getQueryParameter("f")
         deepLinkPw = data.getQueryParameter("pw")
     }
 
@@ -188,13 +197,19 @@ class SettingsActivity : Activity() {
             return
         }
 
-        val baseUrl = "http://$host:$port"
+        // The pin decides the scheme. There is no negotiation and no fallback:
+        // trying https and dropping to http on failure is exactly the downgrade
+        // an attacker would induce.
+        val pin = deepLinkPin ?: PrhPrefs.getTlsPin(this)
+        val scheme = if (pin != null) "https" else "http"
+        val baseUrl = "$scheme://$host:$port"
+
         pairButton.isEnabled = false
         statusText.text = "Pairing…"
 
         scope.launch {
             try {
-                val client = PrhClient(baseUrl)
+                val client = PrhClient(baseUrl, tlsPin = pin)
                 val deviceName = PrhPrefs.getDeviceName(this@SettingsActivity)
 
                 // Enrolment is the one exchange whose compromise hands over
@@ -214,6 +229,7 @@ class SettingsActivity : Activity() {
 
                 PrhPrefs.setBaseUrl(this@SettingsActivity, baseUrl)
                 PrhPrefs.setCredentials(this@SettingsActivity, deviceId, deviceSecret)
+                PrhPrefs.setTlsPin(this@SettingsActivity, pin)
 
                 // One window enrols one device, so the scanned code is spent.
                 // Dropping it stops a stale key sitting in memory and stops a
@@ -225,6 +241,15 @@ class SettingsActivity : Activity() {
                     Toast.makeText(this@SettingsActivity, "Paired", Toast.LENGTH_SHORT).show()
                     requestBatteryExemption()
                     PrhService.start(this@SettingsActivity)
+                }
+            } catch (e: javax.net.ssl.SSLHandshakeException) {
+                // Almost always the pin: prh regenerated its key, or something
+                // other than prh is answering on this address. Say which,
+                // because "handshake failed" sends people to the wrong place.
+                withContext(Dispatchers.Main) {
+                    statusText.text = "prh's TLS key is not the one this code vouches for. " +
+                        "Start pairing again in the editor and scan the new code."
+                    pairButton.isEnabled = true
                 }
             } catch (e: PrhClient.PairingClosed) {
                 withContext(Dispatchers.Main) {

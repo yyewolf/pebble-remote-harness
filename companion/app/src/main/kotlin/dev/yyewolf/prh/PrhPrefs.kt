@@ -32,6 +32,7 @@ object PrhPrefs {
     private const val KEY_BASE_URL = "base_url"
     private const val KEY_DEVICE_ID = "device_id"
     private const val KEY_CURSOR = "cursor"
+    private const val KEY_TLS_PIN = "tls_pin"
 
     private fun securePrefs(context: Context) = EncryptedSharedPreferences.create(
         context,
@@ -73,6 +74,25 @@ object PrhPrefs {
         plainPrefs(context).edit().putString(KEY_BASE_URL, url).apply()
     }
 
+    // -- TLS pin -------------------------------------------------------------
+
+    /**
+     * base64url SHA-256 of prh's public key, learned from the pairing QR.
+     *
+     * Not a secret — every TLS client is handed the certificate anyway — but
+     * it is integrity-critical: whoever can change this value chooses which
+     * server the phone trusts. It lives in the encrypted store for that
+     * reason, not for confidentiality.
+     */
+    fun getTlsPin(context: Context): String? =
+        securePrefs(context).getString(KEY_TLS_PIN, null)
+
+    fun setTlsPin(context: Context, pin: String?) {
+        securePrefs(context).edit().apply {
+            if (pin == null) remove(KEY_TLS_PIN) else putString(KEY_TLS_PIN, pin)
+        }.apply()
+    }
+
     // -- cursor -------------------------------------------------------------
 
     fun getCursor(context: Context): Long =
@@ -91,5 +111,8 @@ object PrhPrefs {
     fun isPaired(context: Context): Boolean =
         getDeviceId(context) != null &&
             getDeviceSecret(context) != null &&
-            getBaseUrl(context) != null
+            getBaseUrl(context) != null &&
+            // An https base URL without a pin cannot connect at all, so a
+            // pairing missing one is not a pairing.
+            (getTlsPin(context) != null || getBaseUrl(context)?.startsWith("http://") == true)
 }

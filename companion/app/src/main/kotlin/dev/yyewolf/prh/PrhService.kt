@@ -122,6 +122,7 @@ class PrhService : Service() {
         val baseUrl = PrhPrefs.getBaseUrl(this)
         val deviceId = PrhPrefs.getDeviceId(this)
         val deviceSecret = PrhPrefs.getDeviceSecret(this)
+        val tlsPin = PrhPrefs.getTlsPin(this)
         if (baseUrl == null || deviceId == null || deviceSecret == null) {
             Log.w(TAG, "not paired, skipping poll loop")
             return
@@ -130,7 +131,7 @@ class PrhService : Service() {
         // No session yet: the client establishes one on its first request and
         // re-establishes it whenever prh forgets, which needs nothing from
         // the user because the device secret is persisted.
-        client = PrhClient(baseUrl, deviceId, deviceSecret)
+        client = PrhClient(baseUrl, deviceId, deviceSecret, tlsPin)
 
         bridge.startRelay { reply ->
             Log.i(TAG, "reply from watch via PKJS: ${reply.eventId} ${reply.action}")

@@ -8,6 +8,7 @@ import org.json.JSONArray
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import javax.net.ssl.HttpsURLConnection
 
 /**
  * HTTP client for the prh daemon. See docs/protocol.md.
@@ -29,6 +30,14 @@ class PrhClient(
     private val baseUrl: String,
     private val deviceId: String? = null,
     private val deviceSecret: String? = null,
+    /**
+     * base64url SHA-256 of prh's public key, from the pairing QR.
+     *
+     * Required for every https base URL. Its absence is not a soft failure to
+     * shrug at: without it there is nothing to distinguish prh from anything
+     * else answering on that address.
+     */
+    private val tlsPin: String? = null,
 ) {
 
     class CursorTooOld : Exception("cursor fell out of the server's ring buffer")
@@ -347,7 +356,16 @@ class PrhClient(
         signing: SigningKey?,
         readTimeoutMs: Int,
     ): Response {
-        val conn = URL(baseUrl.trimEnd('/') + path).openConnection() as HttpURLConnection
+        val url = URL(baseUrl.trimEnd('/') + path)
+        val conn = url.openConnection() as HttpURLConnection
+
+        if (conn is HttpsURLConnection) {
+            val pin = tlsPin
+                ?: throw IOException("no TLS pin for $baseUrl; pair again to obtain one")
+            conn.sslSocketFactory = PrhTls.socketFactory(pin)
+            conn.hostnameVerifier = PrhTls.hostnameVerifier
+        }
+
         conn.requestMethod = method
         conn.setRequestProperty("Accept", "application/json")
         conn.readTimeout = readTimeoutMs

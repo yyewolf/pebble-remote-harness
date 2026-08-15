@@ -6,6 +6,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { spawn } from 'child_process';
 import * as http from 'http';
+import * as https from 'https';
 import * as crypto from 'crypto';
 
 export type DaemonState = 'stopped' | 'starting' | 'running' | 'unpaired' | 'failed';
@@ -19,6 +20,8 @@ export interface Health {
   listen: string;
   paired: boolean;
   pairing: boolean;
+  /** base64url SHA-256 of prh's TLS public key; goes in the pairing QR. */
+  tls_pin?: string;
 }
 
 export interface PairingStatus {
@@ -183,18 +186,54 @@ export class Daemon implements vscode.Disposable {
   }
 
   /**
-   * Fetches /v1/health. Unauthenticated, so this doubles as a liveness probe
-   * for a daemon this window did not start.
+   * Fetches /v1/health over loopback. Unauthenticated, so this doubles as a
+   * liveness probe for a daemon this window did not start.
+   *
+   * prh serves TLS with a self-signed certificate, so validation is disabled
+   * here. That is safe in this one place and nowhere else: the connection
+   * never leaves 127.0.0.1, and this extension is the process that started the
+   * daemon whose certificate it would be checking. There is no network path
+   * for anyone to interpose on.
+   *
+   * The phone gets no such exemption — it pins the key, because its traffic
+   * really does cross a network.
+   *
+   * Uses https.request rather than fetch deliberately: global fetch is undici,
+   * which ignores `agent` and needs a `dispatcher` instead, so passing
+   * rejectUnauthorized through fetch silently fails the handshake and every
+   * health check comes back "daemon is dead".
    */
   async health(): Promise<Health | undefined> {
-    try {
-      const url = `http://127.0.0.1:${this.port}/v1/health`;
-      const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
-      if (!resp.ok) return undefined;
-      return await resp.json() as Health;
-    } catch {
-      return undefined;
-    }
+    return new Promise<Health | undefined>((resolve) => {
+      const req = https.request(
+        {
+          host: '127.0.0.1',
+          port: this.port,
+          path: '/v1/health',
+          method: 'GET',
+          rejectUnauthorized: false,
+          timeout: 3000,
+        },
+        (res) => {
+          let buf = '';
+          res.on('data', (c) => (buf += c));
+          res.on('end', () => {
+            if (res.statusCode !== 200) return resolve(undefined);
+            try {
+              resolve(JSON.parse(buf) as Health);
+            } catch {
+              resolve(undefined);
+            }
+          });
+        },
+      );
+      req.on('error', () => resolve(undefined));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(undefined);
+      });
+      req.end();
+    });
   }
 
   /**

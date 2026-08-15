@@ -91,6 +91,19 @@ async function pair(): Promise<void> {
     return;
   }
 
+  // The TLS pin travels in the same out-of-band hop as the pairing key. A
+  // phone that scanned the code learns both which server to trust and how to
+  // prove itself to it; without the pin it has no way to tell prh from
+  // anything else answering on that address, so pairing cannot proceed.
+  const health = await daemon.health();
+  const pin = health?.tls_pin;
+  if (!pin) {
+    vscode.window.showErrorMessage(
+      'prh did not report a TLS fingerprint. Update the daemon binary and try again.',
+    );
+    return;
+  }
+
   const ttlSec = 120;
   let pairing: { key: string; expiresAt: number };
   try {
@@ -100,7 +113,7 @@ async function pair(): Promise<void> {
     return;
   }
 
-  const url = `prh://${lanAddr}:${port}?k=${pairing.key}`;
+  const url = `prh://${lanAddr}:${port}?k=${pairing.key}&f=${pin}`;
   const qr = renderQrAscii(url);
 
   const panel = vscode.window.createWebviewPanel(
@@ -128,6 +141,8 @@ async function pair(): Promise<void> {
   <p><code>${url}</code></p>
   <p class="warn">This code is a one-time secret. Do not paste it anywhere but
      the app.</p>
+  <p>It carries prh's TLS fingerprint, so the phone can recognise this machine
+     and refuse anything else.</p>
 </body>
 </html>`;
 
