@@ -132,19 +132,47 @@ diagnostics, PTY traffic — is dropped at the hub.
 ## Replying
 
 ```jsonc
-// POST /permission/{requestID}/reply     ← the one we use
-{ "reply": "once" | "always" | "reject",  // required
-  "message": "…",                          // optional
-  "interactive": true }                    // optional
-
-// POST /permission/{requestID}/always-rules
-{ "approvedAlways": ["ls *"], "deniedAlways": [] }
-
-// POST /session/{sessionID}/permissions/{permissionID}   ← older variant
+// POST /session/{sessionID}/permissions/{permissionID}   ← the one we use
 { "response": "once" | "always" | "reject" }
+
+// POST /permission/{requestID}/reply        ← v2 only, NOT reachable from a plugin
+{ "reply": "once" | "always" | "reject",
+  "message": "…",
+  "interactive": true }
+
+// POST /permission/{requestID}/always-rules  ← v2 only
+{ "approvedAlways": ["ls *"], "deniedAlways": [] }
 ```
 
 Query parameters `directory` and `workspace` are accepted on all three.
+
+**Which one a plugin can actually call is not a matter of taste.** A plugin's
+`client` is the *v1* `KiloClient` (`PluginInput.client =
+ReturnType<typeof createKiloClient>` from `@kilocode/sdk`), and the only
+permission method on it is the generated:
+
+```js
+await client.postSessionIdPermissionsPermissionId({
+  path: { id: sessionID, permissionID: requestID },
+  body: { response: "once" },
+})
+```
+
+The friendlier `permission.reply` and the whole `question` namespace exist
+only on the **v2** client, which plugins are not handed. This cost real
+debugging time: the plugin called a `client.permissionReply` that has never
+existed, the resulting `TypeError` was swallowed by the fail-open `catch`, and
+every approval died on the last hop with nothing logged anywhere. Read
+`~/.kilocode/node_modules/@kilocode/sdk/dist/gen/sdk.gen.d.ts` before writing
+a call against `client`.
+
+Note also that `client` is a hey-api client: it **resolves** with
+`{data, error}` rather than throwing on 4xx, so a `catch` alone will not
+notice a rejected reply. Check `res.error`.
+
+Question replies are v2-only (`POST /question/{requestID}/reply`) and take
+`answers: string[][]` — the chosen option *strings*, not an index — so wiring
+them up means forwarding `QuestionInfo.options` from `question.asked` first.
 
 ## Plugin hooks
 
@@ -168,11 +196,11 @@ it would defeat the entire point of asking.
 ## Endpoints we call
 
 ```
-POST /permission/{requestID}/reply                       reply to a permission
-POST /permission/{requestID}/always-rules                persist an allow rule
-POST /session/{sessionID}/permissions/{permissionID}     per-session variant
-POST /api/session/{sessionID}/question/{requestID}/reply answer a question
-POST /api/session/{sessionID}/question/{requestID}/reject
+POST /session/{sessionID}/permissions/{permissionID}     reply to a permission
+POST /permission/{requestID}/reply                       v2 only — unreachable
+POST /permission/{requestID}/always-rules                v2 only — unreachable
+POST /question/{requestID}/reply                         v2 only — unreachable
+POST /question/{requestID}/reject                        v2 only — unreachable
 POST /session/{sessionID}/abort                          stop a running turn
 POST /session/{sessionID}/prompt_async                   send a new prompt
 GET  /session                                            list sessions
