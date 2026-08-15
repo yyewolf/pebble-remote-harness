@@ -25,6 +25,9 @@ Trust the first column; re-check the second before relying on it.
 | Plugin can hold a background loop | **probed** |
 | Plugin fails open with no daemon | **probed** |
 | Global install path + `hello` handshake | **tested end to end** |
+| Permission reply reaching Kilo | **tested end to end** |
+| Plugin reconnect across a `prh` restart | **tested end to end** |
+| Question replies (`choice`/`text`) | **not wired** — v2-only API, refuses |
 | Extension's detect/install of the plugin | **known broken** — see `plugin.md` |
 | Socket election + stale reclaim | **tested** |
 | Plugin routes absent from TCP | **tested** |
@@ -164,3 +167,12 @@ adb shell am broadcast -a com.getpebble.action.app.START \
   localhost:80 instead. Set `socketPath` per request.
 - Nothing logs a plugin load. Watch `upstreams` in `GET /v1/health`; a plugin
   that fails open is indistinguishable from one that was never loaded.
+- A plugin's `client` is the **v1** SDK. `permissionReply` and the `question`
+  namespace are v2-only and do not exist on it; calling one throws a
+  `TypeError` straight into a fail-open `catch`, and the prompt hangs pending
+  with nothing logged. See `kilo-integration.md` for the method that works.
+- `client` resolves with `{data, error}` instead of throwing on 4xx. A bare
+  `try/catch` will report a rejected reply as success.
+- `prh` deletes its socket on a clean exit. Anything that checks for the
+  socket once, at load, dies permanently if it started first — check it on
+  every retry instead.
