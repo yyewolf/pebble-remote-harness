@@ -112,24 +112,121 @@ Reports what was applied, so `prh` can stop retrying and tell the watch.
 
 ## Hop 1 — `prh` ↔ companion (JSON/HTTP)
 
-Default bind `0.0.0.0:8477`. Plaintext HTTP on a trusted LAN; see Security.
+Default bind `0.0.0.0:8477`. Plaintext HTTP on a LAN; see Security.
 
-### `POST /v1/register`
+### Authentication
 
-Trades the shared password for a revocable per-device token. Called once from
-the companion's settings screen.
+Every request except `/v1/health` and `/v1/register` is **signed**. Nothing
+reusable crosses the wire more than once.
+
+Three credentials, each with a different lifetime:
+
+| Credential | Lives | Crosses the wire | Purpose |
+|---|---|---|---|
+| pairing passphrase | argon2id hash in `config.json` | once per device, at registration | enrol a device |
+| device secret | `devices.json` (0600) and the phone's `EncryptedSharedPreferences` | once, in the registration response | prove identity at login |
+| session key | memory on both sides, 12h TTL | never in the clear — wrapped at login | sign every request |
+
+Why not bearer tokens: a bearer token is replayed verbatim on every request,
+so on an unencrypted LAN a single sniffed poll hands an attacker permanent
+authority to approve shell commands. A signature proves possession of a key
+that never crosses the wire, and proves it for one specific request.
+
+#### `POST /v1/register`
+
+The only call carrying the passphrase, and the only signed-exempt one — there
+is nothing to sign with yet.
 
 ```jsonc
 // request
 { "password": "...", "device_name": "Pixel 8", "platform": "android" }
 
-// 200
-{ "device_id": "dev_7f3a", "token": "prh_...", "server_name": "workstation" }
+// 200 — the device secret is returned exactly once and never again
+{ "device_id": "dev_7f3a", "device_secret": "<base64url, 32 bytes>",
+  "server_name": "workstation" }
 // 401 on bad password, 429 after repeated failures
 ```
 
-The token is a bearer credential for every other endpoint. The Kilo password
-never leaves the dev box, and the `prh` password never reaches the watch.
+Rate-limited per IP, because the passphrase is the only user-chosen secret and
+therefore the only one worth guessing at.
+
+#### `POST /v1/login`
+
+Trades the device secret for a session key. **Signed with the device secret**
+(`X-Prh-Key: <device_id>`), so the secret itself stays off the wire.
+
+```jsonc
+// request
+{ "device_id": "dev_7f3a" }
+
+// 200
+{ "key_id": "key_9c1d", "wrap_salt": "<16B>", "wrap_nonce": "<12B>",
+  "wrapped_key": "<sealed 32B>", "expires_at": 1765432100,
+  "server_name": "workstation" }
+// 401 unknown device or bad signature — re-pair with the passphrase
+// 400 device_id does not match the signing key
+```
+
+Unwrap:
+
+```
+wrapKey    = HKDF-SHA256(deviceSecret, salt=wrap_salt, info="prh-session-wrap-v1")
+sessionKey = AES-256-GCM-Open(wrapKey, wrap_nonce, wrapped_key, aad=key_id)
+```
+
+The key ID is authenticated as AEAD additional data, so a swapped key ID fails
+to open rather than binding a good key to the wrong session. Logging in again
+replaces the device's previous session rather than adding one.
+
+#### Signing a request
+
+```
+X-Prh-Key:   <key_id>            (device_id on /v1/login)
+X-Prh-Date:  <unix seconds>
+X-Prh-Nonce: <base64url, >= 16 random bytes>
+X-Prh-Sig:   <base64url HMAC-SHA256 of the canonical string>
+```
+
+The canonical string, joined with `\n`:
+
+```
+PRH1
+<METHOD>
+<path and query, exactly as sent>
+<X-Prh-Date>
+<X-Prh-Nonce>
+<lowercase hex SHA-256 of the body, empty body included>
+```
+
+Each line closes an attack that the others do not:
+
+- **method and path** — a captured `GET /v1/poll` cannot be rewritten into a
+  `POST /v1/reply`. That is the difference between reading a prompt and
+  approving `rm -rf`.
+- **query** — `?cursor=` is part of what was authorised.
+- **date** — ±10s leeway, enforced in *both* directions. Future-dating would
+  otherwise let an attacker record a request now and hold it.
+- **nonce** — single-use per key, cached for 2× the leeway, so a capture
+  cannot be replayed even inside the window the date allows.
+- **body hash** — a `reject` cannot be edited into an `always` in flight.
+
+A skew rejection carries `X-Prh-Time: <unix seconds>`. The client adopts the
+offset and retries; without it a phone with a drifting clock fails every
+request with a 401 indistinguishable from a bad credential.
+
+#### `POST /v1/heartbeat`
+
+```jsonc
+// 200
+{ "ok": true, "expires_at": 1765432100, "server_time": 1765388900 }
+// 401 — session gone, log in again
+```
+
+Sessions are memory-only, so a `prh` restart drops all of them. The heartbeat
+is how the companion finds that out on a schedule instead of discovering it
+when a prompt is already blocking the agent. Recovery needs nothing from the
+user: the device secret is persisted on both sides, so the phone logs in again
+by itself. The companion beats every 4 minutes against a 12h TTL.
 
 ### `GET /v1/poll?cursor=<n>&wait=<seconds>`
 
@@ -209,7 +306,11 @@ Dictation that starts new work rather than answering a prompt. Becomes a
 ### `GET /v1/health`
 
 Unauthenticated liveness, for the extension's status bar. Returns version,
-uptime, connected Kilo instances, registered device count. No secrets.
+uptime, connected Kilo instances, registered device count, and live session
+count. No secrets.
+
+`sessions` drops to zero on restart while `devices` does not — that difference
+is exactly the condition heartbeats repair.
 
 ## Hop 2 — companion ↔ watchapp (AppMessage)
 
@@ -273,17 +374,51 @@ the innermost one. Full threat model in `plugin.md`.
 
 **Hop 1 (`prh` ↔ companion)** — the exposed surface.
 
-- The pairing password is stored **hashed** (argon2id) in `prh` config; the
-  plaintext lives only in VSCode `SecretStorage`.
+- The pairing passphrase is stored **hashed** (argon2id) in `prh` config; the
+  plaintext lives only in VSCode `SecretStorage` and crosses the wire once per
+  device.
 - Registration is rate-limited; repeated failures lock out the source IP.
-- Device tokens are independently revocable from the extension.
+  Login is not rate-limited and does not need to be — a device secret is 32
+  random bytes, so there is nothing to guess.
+- **Every other request is signed**, so no credential is replayable. See
+  Authentication above for what each signed field defends against.
+- Devices are independently revocable from the extension, and revoking one
+  drops its live sessions immediately rather than letting them run out their
+  TTL.
 - `prh` binds `0.0.0.0` by default because the phone must reach it. Narrow
   this to the LAN interface if the host is multi-homed.
-- **Traffic is plaintext HTTP, and envelope bodies are command lines and file
-  paths.** This is the weakest link in the design. LAN-trust only; off-LAN,
-  put it behind Tailscale rather than port-forwarding. The intended fix is a
-  self-signed certificate whose fingerprint travels in the pairing QR, so the
-  companion can pin it without a CA.
+- **Traffic is still plaintext HTTP, and envelope bodies are command lines and
+  file paths.** Signing authenticates requests; it does not encrypt them. An
+  attacker on the LAN cannot forge or replay an approval, but can still *read*
+  what the agent proposed. That is now the weakest link. LAN-trust only;
+  off-LAN, put it behind Tailscale rather than port-forwarding. The intended
+  fix is a self-signed certificate whose fingerprint travels in the pairing QR,
+  so the companion can pin it without a CA.
+
+### Secrets at rest
+
+Signing needs the key on both sides, so `devices.json` holds device secrets in
+**plaintext** at mode 0600, written atomically (temp file, fsync, rename) so a
+crash cannot truncate it into an empty registry that silently deauthorises
+every phone.
+
+That is a deliberate trade against the previous design, which stored only
+token *hashes*. It moves an exposure from the wire to the disk:
+
+- before — a credential replayed on every request over unencrypted LAN HTTP,
+  where sniffing it is passive and undetectable
+- after — a credential in a 0600 file, readable only by a process already
+  running as this user, which by then can read the source, the Kilo password,
+  and the SSH keys anyway
+
+On a machine an attacker already owns, the device secret is not the
+interesting thing they found. On a LAN they merely share, it was.
+
+The companion mirrors this: the device secret goes in
+`EncryptedSharedPreferences`. The session key is never written to disk — it is
+short-lived, cheap to re-obtain, and worthless after a restart. Neither is the
+passphrase, which would be a *stronger* secret than the one it protects, since
+it can enrol new devices.
 
 **Hop 2 (companion ↔ watch)** — Bluetooth, and out of our hands. Anyone who
 can see your wrist can read what the agent proposed.

@@ -29,6 +29,10 @@ Trust the first column; re-check the second before relying on it.
 | Plugin reconnect across a `prh` restart | **tested end to end** |
 | Question replies (`choice`/`text`) | **not wired** — v2-only API, refuses |
 | Extension's detect/install of the plugin | **known broken** — see `plugin.md` |
+| Signed requests: replay, skew, retarget, tamper | **tested** |
+| Session wrap unwraps with the device secret only | **tested** |
+| Devices survive a `prh` restart | **tested** |
+| Companion re-login after a `prh` restart | **not tested on hardware** |
 | Socket election + stale reclaim | **tested** |
 | Plugin routes absent from TCP | **tested** |
 | `app.START` wakes a closed watchapp | **tested on hardware** |
@@ -69,21 +73,23 @@ the VSCode UI. Then check the safety rules actually hold: replay the same
 decision (must be idempotent), send an unknown `request_id` (must be
 refused), let one expire (must stay pending, never approve).
 
-### M3 — device auth
+### M3 — device auth ✅
 
 *Files:* `api/internal/auth`, `api/internal/httpapi`
 
-- argon2id via `golang.org/x/crypto` — the module's first dependency
-- `/v1/register`, bearer auth, rate limiting
+Done. argon2id pairing, per-device secrets persisted to `devices.json`,
+signed requests with replay and skew rejection, `/v1/login` and
+`/v1/heartbeat`. A wrong password is rejected and rate-limited; a revoked
+device loses access immediately, sessions included.
 
-**Done when:** a wrong password is rejected and rate-limited, and a revoked
-token stops working immediately.
+What is *not* done: the extension has no UI for listing or revoking devices,
+so revocation is currently a matter of editing `devices.json` and restarting.
 
 ### M4 — the companion
 
 *Files:* `companion/`
 
-- settings + `prh://` deep link, token in `EncryptedSharedPreferences`
+- settings + `prh://` deep link, device secret in `EncryptedSharedPreferences`
 - foreground service holding the long-poll
 - `PebbleBridge`: `startAppOnPebble`, `sendDataToPebble`, reply receiver
 
@@ -119,9 +125,10 @@ the other's upstream working.
 
 ## Cross-cutting, currently absent
 
-- **No tests anywhere, and no CI.** Highest-value first tests: hub translation
-  against the captured `permission.asked` payload, ring-buffer eviction and
-  the `410` cursor path, and the plugin's decision-safety rules.
+- **No CI**, though `api/` now has tests: `go test ./...` covers hub
+  translation, ring-buffer eviction, the `410` cursor path, and the whole Hop 1
+  auth surface. Nothing covers the plugin's decision-safety rules or the
+  companion, and both would repay it.
 - **TLS on Hop 1.** Prompt bodies are command lines in plaintext. The intended
   fix is a self-signed cert with its fingerprint in the pairing QR.
 - **The OpenAPI spec is not vendored.** Regenerate it with the snippet at the
@@ -176,3 +183,16 @@ adb shell am broadcast -a com.getpebble.action.app.START \
 - `prh` deletes its socket on a clean exit. Anything that checks for the
   socket once, at load, dies permanently if it started first — check it on
   every retry instead.
+- The signed canonical string must match **byte for byte** across Go and
+  Kotlin. A mismatch surfaces as a uniform `401` with no hint about which
+  field disagreed. The usual culprits: dropping the query string, using the
+  path instead of the full request URI, and forgetting that an empty body
+  still contributes `sha256("")`.
+- HKDF *extract* keys the HMAC with the **salt**, not the secret. Reversing
+  them produces plausible bytes that never match the other side.
+- A `401` on Hop 1 is routine, not fatal: it usually means `prh` restarted and
+  dropped its sessions. Clients log in again and retry once. Only `/v1/login`
+  returning 401 means the pairing is actually gone.
+- Android has no HKDF in the platform library before API 35, so the companion
+  implements RFC 5869 in `PrhSigning`. Do not swap it for a library without
+  checking what that library pulls into the process holding the approval key.

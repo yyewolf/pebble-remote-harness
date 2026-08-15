@@ -98,7 +98,7 @@ that already protect the socket. Do not add security theatre.
 |---|---|
 | plugin → `prh` | connect to a socket in a `0700` dir; `prh` verifies peer UID |
 | `prh` → plugin | the socket path is unforgeable by other users |
-| `prh` → companion | pairing password, then a revocable device token |
+| `prh` → companion | pairing passphrase once, then a revocable device secret that only ever signs |
 | `prh` → Kilo | **none — deliberately impossible** |
 
 ## Installation lifecycle

@@ -126,9 +126,12 @@ async function pair(): Promise<void> {
 /**
  * Sets or regenerates the pairing password.
  *
- * Default to a generated passphrase; changing it must revoke every existing
- * device token, since the old password is what those devices were issued
- * against.
+ * Default to a generated passphrase.
+ *
+ * Note that changing it does **not** revoke existing devices: they hold device
+ * secrets issued at pairing and sign with those, never with the passphrase.
+ * Rotating the passphrase only stops *new* pairings. Revoking a device is a
+ * separate action against `devices.json`, and is still unimplemented here.
  */
 async function setPassword(): Promise<void> {
   if (!daemon) return;

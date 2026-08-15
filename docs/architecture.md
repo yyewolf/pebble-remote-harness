@@ -24,7 +24,8 @@ session stops.
   │   hub/    translate + queue  │
   │   httpapi/ long-poll + auth  │
   └──────────────┬───────────────┘
-                 │  POST /v1/register   (password -> device token)
+                 │  POST /v1/register  (passphrase -> device secret)
+                 │  POST /v1/login     (device secret -> session key)
                  │  GET  /v1/poll       (long-poll, watch-sized envelopes)
                  │  POST /v1/reply
                  ▼
