@@ -30,6 +30,9 @@ Trust the first column; re-check the second before relying on it.
 | Question replies (`choice`/`text`) | **not wired** — v2-only API, refuses |
 | Extension's detect/install of the plugin | **known broken** — see `plugin.md` |
 | Signed requests: replay, skew, retarget, tamper | **tested** |
+| Pairing window gates enrolment, closes after one device | **tested end to end** |
+| Sealed enrolment: capture yields nothing usable | **tested end to end** |
+| Admin routes absent from the TCP listener | **tested** |
 | Session wrap unwraps with the device secret only | **tested** |
 | Devices survive a `prh` restart | **tested** |
 | Companion re-login after a `prh` restart | **not tested on hardware** |
@@ -82,8 +85,15 @@ signed requests with replay and skew rejection, `/v1/login` and
 `/v1/heartbeat`. A wrong password is rejected and rate-limited; a revoked
 device loses access immediately, sessions included.
 
+Enrolment is gated on a pairing window (`prh pair`, or **Pebble Harness:
+Pair**), and a scanned code seals the response so capturing the exchange yields
+nothing.
+
 What is *not* done: the extension has no UI for listing or revoking devices,
 so revocation is currently a matter of editing `devices.json` and restarting.
+The QR renderer is still an ASCII placeholder, so the scanned path cannot
+actually be used from the editor until it draws a real code — the CLI's
+`prh pair` URL can be entered by hand in the meantime.
 
 ### M4 — the companion
 
@@ -196,3 +206,9 @@ adb shell am broadcast -a com.getpebble.action.app.START \
 - Android has no HKDF in the platform library before API 35, so the companion
   implements RFC 5869 in `PrhSigning`. Do not swap it for a library without
   checking what that library pulls into the process holding the approval key.
+- The session wrap and the pairing wrap share a recipe and differ only in
+  their HKDF `info` string. Reusing one string for both would let a blob sealed
+  for one purpose be opened as the other.
+- Subcommands come first: `prh pair -config X`, not `prh -config X pair`. The
+  latter starts the daemon and fails with "another prh is already running",
+  which reads like a bug and is not.
