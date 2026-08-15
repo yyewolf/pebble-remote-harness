@@ -54,7 +54,9 @@ this; a bounded queue that drops on overflow is correct.
 ```jsonc
 { "upstream_id": "up_3f9a",
   "events": [
-    { "kind": "permission",        // permission | question | idle | error | replied
+    { "kind": "permission",        // permission | question | idle | error | replied |
+                                   // message | session.created | session.updated |
+                                   // session.deleted | session.status
       "request_id": "per_01H…",    // the ID a decision must match
       "session_id": "ses_01H…",
       "action": "bash",            // Kilo's "permission" field
@@ -74,6 +76,14 @@ bare "Always", or the user consents to something they were never shown.
 `kind: "replied"` carries only `request_id` and `session_id`. It fires when a
 prompt is answered anywhere — including the VSCode UI — and becomes a `gone`
 envelope so the watch stops asking a settled question.
+
+`kind: "message"` carries `msg_role`, `msg_part_id`, `msg_text`, `msg_kind`,
+`msg_time_ms` — the accumulated text of one part, not per-token deltas. The
+phone renders these into its conversation view; the watch never receives them.
+
+`kind: "session.*"` carries `session_title`, `session_dir`, `session_status`
+(from Kilo's `Session` struct and `session.status`), so `prh` can build a
+session registry from events without ever calling Kilo's API.
 
 `prh` truncates to the limits below and turns these into envelopes.
 
@@ -355,7 +365,7 @@ are truncated by `prh`, not by the companion, so truncation is consistent.
 {
   "id":      "evt_0042",         // ack target, also the reply target
   "seq":     42,
-  "type":    "perm",             // perm | ques | idle | err | note
+  "type":    "perm",             // perm | ques | idle | err | note | msg | gone
   "project": "infra",            // <= 24 chars; which window is asking
   "session": "ses_ab12",         // opaque id, for /v1/prompt routing
   "title":   "bash",             // <= 32 chars, the action
@@ -365,14 +375,44 @@ are truncated by `prh`, not by the companion, so truncation is consistent.
 }
 ```
 
-| `type` | Source event | Watch behaviour |
-|---|---|---|
-| `perm` | `permission.v2.asked` | Wake app, vibrate, show prompt card |
-| `ques` | `question.v2.asked` | Wake app, vibrate, show choice list |
-| `idle` | `session.idle` | Notify only, no reply expected |
-| `err`  | `session.error` | Notify only, no reply expected |
-| `note` | internal | Status text, no reply expected |
-| `gone` | `permission.replied` | Dismiss `id`; it was answered elsewhere |
+`msg` envelopes carry extra fields the companion uses for its conversation view
+and the watch never sees (they do not cross Bluetooth):
+
+```jsonc
+{
+  "type":      "msg",
+  "session":   "ses_ab12",
+  "msg_role":  "assistant",      // user | assistant
+  "msg_part_id": "p_01H…",       // part id, for replace-in-place
+  "msg_text":  "I'll remove the build directory",  // accumulated part text, <= 4096
+  "msg_kind":  "text",           // text | reasoning | tool | step-start | file | patch
+  "msg_time":  1765400000000     // unix ms
+}
+```
+
+| `type` | Source event | Stream | Watch behaviour | Companion behaviour |
+|---|---|---|---|---|
+| `perm` | `permission.v2.asked` | both | Wake app, vibrate, show prompt card | Inline approve in conversation view |
+| `ques` | `question.v2.asked` | both | Wake app, vibrate, show choice list | Inline approve in conversation view |
+| `idle` | `session.idle` | `/v1/poll` | Notify only, no reply expected | Status update |
+| `err`  | `session.error` | `/v1/poll` | Notify only, no reply expected | Status update |
+| `note` | internal | `/v1/poll` | Status text, no reply expected | Status update |
+| `msg`  | `message.part.updated` | conversation | **never sent** — does not cross Bluetooth | Conversation view |
+| `gone` | `permission.replied` | both | Dismiss `id`; it was answered elsewhere | Clear pending prompt |
+
+**`msg` envelopes are never published to `/v1/poll`.** The poll ring is the
+watch's stream: it is small, and the companion downloads all of it before
+discarding what the watch does not need. A streaming reply emits hundreds of
+part updates, which would spend the phone's mobile data on content the poll
+path throws away and — the real damage — evict pending permission envelopes
+from the ring before the watch ever polled them. Conversation has its own
+endpoint so it cannot crowd out the prompts.
+
+Prompts appear on **both** streams: `/v1/poll` for the watch, and the owning
+session's conversation so the phone can render approve/reject inline under the
+context that led to the request. When the prompt is settled — on the watch, on
+the phone, or at the desk — a `gone` envelope replaces it under the same `id`
+in both places.
 
 ### `POST /v1/reply`
 
@@ -402,6 +442,89 @@ Dictation that starts new work rather than answering a prompt. Becomes a
 ```jsonc
 { "session": "ses_ab12", "text": "run the tests again" }
 ```
+
+### Sessions + conversation (phone UI)
+
+The phone has a session list and a per-session conversation view, so you can
+read what the agent is doing before approving from the phone — the watch's
+200px screen cannot show enough context for that. These endpoints are signed
+like the rest of Hop 1; the conversation data never crosses Bluetooth.
+
+`prh` builds the session registry from events the plugin forwards
+(`session.created/updated/deleted/status`), not by calling Kilo, so it needs
+no credentials. Conversation content comes from `message.part.updated`, which
+the plugin forwards as `kind: "message"` events.
+
+#### `GET /v1/sessions`
+
+```jsonc
+// 200
+{ "sessions": [
+  { "id": "ses_ab12",
+    "project": "infra",           // which window owns it
+    "title": "Fix the login bug",  // Kilo's session title, truncated
+    "dir": "infra",                // working directory basename
+    "status": "busy",              // idle | busy | retry | unknown
+    "updated": 1765400000000,      // unix ms, last activity
+    "has_prompt": true,            // a perm/ques envelope is pending
+    "prompt_id": "evt_0042",       // the pending envelope id
+    "prompt_type": "perm"          // perm | ques
+  } ] }
+```
+
+`has_prompt` is what the session list badges — a session with a pending prompt
+is the one you want to open.
+
+#### `GET /v1/sessions/{id}/conversation?cursor=<n>&wait=<seconds>`
+
+Long-poll, like `/v1/poll`. Returns the session's conversation entries newer
+than the per-session cursor: `msg` envelopes, plus any `perm`/`ques` prompt
+belonging to this session and the `gone` that retracts it.
+
+```jsonc
+// 200
+{ "cursor": 3,
+  "events": [ /* envelopes, creation order, oldest first */ ] }
+// 404 unknown session (prh restarted, or it was never seen)
+```
+
+The cursor is per-session, separate from the `/v1/poll` cursor, so the
+conversation view and the watch's prompt stream advance independently.
+
+Entries are keyed by `id` — the part id for a message, the envelope id for a
+prompt — and an entry that already exists is **replaced in place**, keeping its
+original position while taking a fresh `cursor` value. The agent streams by
+re-sending a part with more text, dozens to hundreds of times per reply, so a
+client must render by `id` rather than appending: the same `id` arriving again
+is a correction, not a new message. `prh` keeps the last 50 entries per
+session, counted as messages rather than updates — without the replace, one
+streaming reply would evict the entire history behind it.
+
+An entry whose text is empty is a retraction: the agent removed that part, and
+the client should drop the row.
+
+#### `POST /v1/sessions/{id}/prompt`
+
+Replies in a session — starts a new turn by sending text. Becomes a
+`kind: "prompt"` decision on Hop 0, which the plugin applies via Kilo's
+`prompt_async`. `prh` never holds credentials, so it cannot send the text
+itself.
+
+```jsonc
+{ "text": "use the queue approach instead" }   // <= 4096 bytes, truncated
+// 200 {"ok":true}
+// 400 empty text
+// 404 unknown session
+// 409 the window that owned the session is gone — retrying will not help
+```
+
+This is the "reply in sessions" affordance. It does not answer a pending
+permission prompt — use `/v1/reply` for that. It starts new work, the same way
+dictation does, but from the phone with full context visible.
+
+The plugin applies it through `client.session.promptAsync` and deduplicates on
+the decision's nonce, so a redelivered decision cannot inject the same message
+into a session twice.
 
 ### Admin plane — unix socket only
 

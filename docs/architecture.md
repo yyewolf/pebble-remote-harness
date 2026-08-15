@@ -176,6 +176,12 @@ An npm module installed globally with `kilo plugin -g`, so it loads into every
 kilo server on the machine. Pushes permission and question events up to `prh`
 and long-polls for decisions, which it applies through its in-process client.
 
+It also forwards what the agent is **saying** (`message.part.updated`) and
+the session lifecycle (`session.created/updated/deleted/status`), so the
+phone can show conversation context and a session list. And it applies
+`prompt` decisions — text the phone sends into a session — via Kilo's
+`prompt_async`, which is the "reply in sessions" affordance.
+
 It is the only component holding Kilo credentials, and it never transmits
 them. It must fail open: no `prh`, no socket, no problem — the coding session
 continues untouched.
@@ -193,6 +199,13 @@ never leaving the dev box.
 - PebbleKit bridge: `startAppOnPebble`, `sendDataToPebble`, ack receiver
 - settings UI for server address + password, and pairing status
 - Android notification as a visible fallback when the watch is unreachable
+- **session list + per-session conversation view** — the phone surface for
+  context the 200px watch screen cannot show. Lists every session across
+  every window (`GET /v1/sessions`), renders the conversation
+  (`GET /v1/sessions/{id}/conversation`), and lets you approve a pending
+  prompt or reply with text (`POST /v1/sessions/{id}/prompt`) from the phone.
+  `msg` envelopes never reach the watch: conversation is phone-only and stays
+  off the slow, snooppable Bluetooth hop.
 
 Min SDK 26 (foreground services), target current. Not compilable in this
 checkout — no JDK or Android SDK present.
