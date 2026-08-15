@@ -10,7 +10,10 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -25,8 +28,13 @@ import com.journeyapps.barcodescanner.ScanIntentResult
 import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Date
 
 /**
  * Pairing and status.
@@ -46,7 +54,16 @@ class SettingsActivity : ComponentActivity() {
     private lateinit var pairButton: Button
     private lateinit var scanButton: Button
     private lateinit var sessionsButton: Button
+    private lateinit var heartbeatText: TextView
+    private lateinit var watchCheck: CheckBox
+    private lateinit var notifCheck: CheckBox
     private val scope = CoroutineScope(Dispatchers.Main)
+
+    /** Ticks the heartbeat line while this screen is on top. */
+    private var heartbeatJob: Job? = null
+
+    /** The user's 12/24h preference, resolved once. */
+    private val timeFormat by lazy { android.text.format.DateFormat.getTimeFormat(this) }
 
     /**
      * Launches the in-app QR scanner. The decoded text — a `prh://` deep
@@ -156,9 +173,39 @@ class SettingsActivity : ComponentActivity() {
         }
         sessionsButton = Button(this).apply {
             text = getString(R.string.sessions_button)
-            visibility = android.view.View.GONE
+            visibility = View.GONE
             setOnClickListener {
                 startActivity(Intent(this@SettingsActivity, SessionsActivity::class.java))
+            }
+        }
+
+        heartbeatText = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, 4, 0, 0)
+        }
+
+        // isChecked before the listener, deliberately: attaching first would
+        // fire the callback for the value that was just read back out of prefs
+        // and write it straight in again, which is harmless here but is how
+        // toggle state ends up being "changed" by merely opening the screen.
+        watchCheck = CheckBox(this).apply {
+            text = getString(R.string.watch_notifications)
+            isChecked = PrhPrefs.isWatchEnabled(this@SettingsActivity)
+            setOnCheckedChangeListener { _, checked ->
+                PrhPrefs.setWatchEnabled(this@SettingsActivity, checked)
+                warnIfNothingAlerts()
+            }
+        }
+        notifCheck = CheckBox(this).apply {
+            text = getString(R.string.phone_notifications)
+            isChecked = PrhPrefs.isPhoneNotificationsEnabled(this@SettingsActivity)
+            setOnCheckedChangeListener { _, checked ->
+                PrhPrefs.setPhoneNotificationsEnabled(this@SettingsActivity, checked)
+                // Turning this on is worthless while POST_NOTIFICATIONS is
+                // denied — notify() would be dropped without an error — so the
+                // ask happens at the moment the intent is expressed.
+                if (checked) requestNotificationPermission()
+                warnIfNothingAlerts()
             }
         }
 
@@ -170,6 +217,11 @@ class SettingsActivity : ComponentActivity() {
         root.addView(scanButton)
         root.addView(statusText)
         root.addView(sessionsButton)
+        root.addView(heading(getString(R.string.connection_heading)))
+        root.addView(heartbeatText.fullWidth())
+        root.addView(heading(getString(R.string.delivery_heading)))
+        root.addView(watchCheck.fullWidth())
+        root.addView(notifCheck.fullWidth())
         scroll.addView(root)
         setContentView(scroll)
         scroll.padForSystemBars()
@@ -183,6 +235,118 @@ class SettingsActivity : ComponentActivity() {
         super.onNewIntent(intent)
         parseDeepLink(intent)
         prefill()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            while (isActive) {
+                renderHeartbeat()
+                // Every second, because the useful part is watching the age
+                // reset: if it keeps climbing past a minute the poll is not
+                // coming back, and that is the whole diagnosis.
+                delay(1_000)
+            }
+        }
+    }
+
+    override fun onPause() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+        super.onPause()
+    }
+
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    // -- connection health --------------------------------------------------
+
+    /**
+     * Renders "is this working right now?" as one line.
+     *
+     * Two independent facts, because either alone lies. The service can be
+     * running while every request fails, and the last contact can look recent
+     * seconds after the process was killed. Together they say which.
+     */
+    private fun renderHeartbeat() {
+        val running = PrhService.running
+        val hb = PrhPrefs.getHeartbeat(this)
+        if (hb == null) {
+            heartbeatText.text = getString(R.string.heartbeat_never)
+            heartbeatText.setTextColor(COLOR_MUTED)
+            return
+        }
+
+        val age = System.currentTimeMillis() - hb.atMs
+        val stale = age > STALE_AFTER_MS
+        heartbeatText.text = buildString {
+            append(if (running) "Service running" else "Service stopped")
+            append(" · ")
+            append(if (hb.ok) "last contact " else "last failure ")
+            append(ago(age))
+            append(" at ")
+            append(timeFormat.format(Date(hb.atMs)))
+            append(" (")
+            append(hb.kind)
+            append(")")
+            if (hb.detail.isNotEmpty()) append("\n").append(hb.detail)
+        }
+        heartbeatText.setTextColor(
+            when {
+                !running || !hb.ok -> COLOR_BAD
+                stale -> COLOR_WARN
+                else -> COLOR_GOOD
+            },
+        )
+    }
+
+    private fun ago(ms: Long): String {
+        val s = (ms / 1000).coerceAtLeast(0)
+        return when {
+            s < 60 -> "${s}s ago"
+            s < 3_600 -> "${s / 60}m ago"
+            s < 86_400 -> "${s / 3_600}h ago"
+            else -> "${s / 86_400}d ago"
+        }
+    }
+
+    /**
+     * Both destinations off is legal — the conversation view still works and
+     * still answers prompts — but it is almost never what someone meant to do,
+     * so say it once rather than letting an agent block unnoticed.
+     */
+    private fun warnIfNothingAlerts() {
+        if (!watchCheck.isChecked && !notifCheck.isChecked) {
+            Toast.makeText(
+                this,
+                "Nothing will alert you now — prompts only appear inside the app",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
+
+    // -- small view helpers -------------------------------------------------
+
+    private fun heading(label: String) = TextView(this).apply {
+        text = label
+        textSize = 13f
+        setTextColor(COLOR_MUTED)
+        setPadding(0, 32, 0, 4)
+    }.fullWidth()
+
+    /**
+     * The root centres its children horizontally, which leaves a label or a
+     * checkbox floating in the middle of the screen at its own measured width.
+     * Full-width children left-align their content instead.
+     */
+    private fun <T : View> T.fullWidth(): T = apply {
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
     }
 
     // -- deep link ---------------------------------------------------------
@@ -408,5 +572,20 @@ class SettingsActivity : ComponentActivity() {
             return
         }
         notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    private companion object {
+        /**
+         * How old a successful contact has to get before it stops counting as
+         * healthy. The long-poll uses a 55s wait, so a working connection
+         * refreshes the timestamp at least that often; anything past 90s means
+         * a poll did not come back when it should have.
+         */
+        const val STALE_AFTER_MS = 90_000L
+
+        const val COLOR_GOOD = 0xFF2E7D32.toInt()
+        const val COLOR_WARN = 0xFFEF6C00.toInt()
+        const val COLOR_BAD = 0xFFC62828.toInt()
+        const val COLOR_MUTED = 0xFF888888.toInt()
     }
 }

@@ -9,4 +9,9 @@
     <string name="sessions_button">Sessions</string>
     <string name="sessions_title">Sessions</string>
     <string name="conversation_title">Conversation</string>
+    <string name="delivery_heading">Delivery</string>
+    <string name="watch_notifications">Send prompts to the watch</string>
+    <string name="phone_notifications">Show notifications on this phone</string>
+    <string name="connection_heading">Connection</string>
+    <string name="heartbeat_never">No contact with prh yet</string>
 </resources>

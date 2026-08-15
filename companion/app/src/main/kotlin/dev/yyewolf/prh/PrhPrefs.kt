@@ -34,6 +34,14 @@ object PrhPrefs {
     private const val KEY_CURSOR = "cursor"
     private const val KEY_TLS_PIN = "tls_pin"
 
+    private const val KEY_HB_AT = "heartbeat_at"
+    private const val KEY_HB_OK = "heartbeat_ok"
+    private const val KEY_HB_KIND = "heartbeat_kind"
+    private const val KEY_HB_DETAIL = "heartbeat_detail"
+
+    private const val KEY_WATCH_ENABLED = "watch_enabled"
+    private const val KEY_PHONE_NOTIFS_ENABLED = "phone_notifs_enabled"
+
     private fun securePrefs(context: Context) = EncryptedSharedPreferences.create(
         context,
         FILE_SECURE,
@@ -100,6 +108,87 @@ object PrhPrefs {
 
     fun setCursor(context: Context, cursor: Long) {
         plainPrefs(context).edit().putLong(KEY_CURSOR, cursor).apply()
+    }
+
+    // -- heartbeat ----------------------------------------------------------
+
+    /**
+     * The last time the companion got an answer out of prh, and whether it was
+     * a good one.
+     *
+     * [kind] says which call produced it. Both count, and both matter for
+     * different reasons: `poll` is the connection that actually delivers
+     * prompts and refreshes at most every 55 seconds, so a stale one means
+     * prompts are not arriving right now. `heartbeat` fires every four minutes
+     * and is the thing that notices a dead session while nothing is happening.
+     * A `poll` timestamp is therefore the stronger signal, and it is the one
+     * that will normally be showing.
+     */
+    data class Heartbeat(
+        val atMs: Long,
+        val ok: Boolean,
+        val kind: String,
+        val detail: String,
+    )
+
+    /**
+     * Records one contact attempt. Written from the service's IO threads;
+     * `apply()` is asynchronous, so this costs nothing on the poll path.
+     *
+     * Wall-clock, not [android.os.SystemClock.elapsedRealtime]: the value has
+     * to stay meaningful across a process death, because "last contact 6h ago"
+     * is exactly how you find out the service is no longer running.
+     */
+    fun recordHeartbeat(context: Context, ok: Boolean, kind: String, detail: String = "") {
+        plainPrefs(context).edit()
+            .putLong(KEY_HB_AT, System.currentTimeMillis())
+            .putBoolean(KEY_HB_OK, ok)
+            .putString(KEY_HB_KIND, kind)
+            .putString(KEY_HB_DETAIL, detail)
+            .apply()
+    }
+
+    /** The last recorded contact, or null if the app has never reached prh. */
+    fun getHeartbeat(context: Context): Heartbeat? {
+        val prefs = plainPrefs(context)
+        val at = prefs.getLong(KEY_HB_AT, 0L)
+        if (at == 0L) return null
+        return Heartbeat(
+            atMs = at,
+            ok = prefs.getBoolean(KEY_HB_OK, false),
+            kind = prefs.getString(KEY_HB_KIND, "") ?: "",
+            detail = prefs.getString(KEY_HB_DETAIL, "") ?: "",
+        )
+    }
+
+    // -- delivery toggles ----------------------------------------------------
+
+    /**
+     * Whether prompts are pushed to the watchapp over Bluetooth.
+     *
+     * Off is a real mode, not a degraded one: the phone still receives
+     * everything and can answer from the conversation view. It is there for
+     * when the watch is not on your wrist, or is busy being a watch.
+     */
+    fun isWatchEnabled(context: Context): Boolean =
+        plainPrefs(context).getBoolean(KEY_WATCH_ENABLED, true)
+
+    fun setWatchEnabled(context: Context, enabled: Boolean) {
+        plainPrefs(context).edit().putBoolean(KEY_WATCH_ENABLED, enabled).apply()
+    }
+
+    /**
+     * Whether prompts raise an Android notification.
+     *
+     * This does not cover the foreground service's own ongoing notification:
+     * that one is what keeps the poll alive on API 26+ and is not optional
+     * while the service is running.
+     */
+    fun isPhoneNotificationsEnabled(context: Context): Boolean =
+        plainPrefs(context).getBoolean(KEY_PHONE_NOTIFS_ENABLED, true)
+
+    fun setPhoneNotificationsEnabled(context: Context, enabled: Boolean) {
+        plainPrefs(context).edit().putBoolean(KEY_PHONE_NOTIFS_ENABLED, enabled).apply()
     }
 
     // -- paired? -----------------------------------------------------------

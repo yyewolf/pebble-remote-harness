@@ -37,6 +37,19 @@ class PrhService : Service() {
         private const val TAG = "PrhService"
 
         /**
+         * Whether the service is alive, for the settings screen to show.
+         *
+         * The activity and the service share a process, so this is a direct
+         * read rather than a bind. It answers the question a stale heartbeat
+         * only implies: "is the thing that polls even running?" — which was
+         * previously invisible, and is exactly how a killed service went
+         * unnoticed while the app still said "Paired".
+         */
+        @Volatile
+        var running: Boolean = false
+            private set
+
+        /**
          * Well under the 12h session TTL, and frequent enough that a prh
          * restart is noticed before the next prompt rather than during it.
          * One tiny signed request every few minutes is cheaper than a missed
@@ -73,12 +86,14 @@ class PrhService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        running = true
         startForeground()
         startPollLoop()
         return START_STICKY
     }
 
     override fun onDestroy() {
+        running = false
         bridge.shutdown()
         scope.cancel()
         super.onDestroy()
@@ -126,6 +141,7 @@ class PrhService : Service() {
         val tlsPin = PrhPrefs.getTlsPin(this)
         if (baseUrl == null || deviceId == null || deviceSecret == null) {
             Log.w(TAG, "not paired, skipping poll loop")
+            PrhPrefs.recordHeartbeat(this, ok = false, kind = "poll", detail = "not paired")
             return
         }
         Log.i(TAG, "starting poll loop against $baseUrl")
@@ -161,12 +177,21 @@ class PrhService : Service() {
             delay(HEARTBEAT_INTERVAL_MS)
             try {
                 client.heartbeat()
+                PrhPrefs.recordHeartbeat(this@PrhService, ok = true, kind = "heartbeat")
             } catch (e: PrhClient.NotPaired) {
                 // Nothing to retry: prh has forgotten this device entirely.
                 Log.e(TAG, "pairing rejected by prh; re-pair from settings", e)
+                PrhPrefs.recordHeartbeat(
+                    this@PrhService, ok = false, kind = "heartbeat",
+                    detail = "pairing rejected — re-pair from the editor",
+                )
                 return
             } catch (e: Exception) {
                 Log.w(TAG, "heartbeat failed: ${e.message}")
+                PrhPrefs.recordHeartbeat(
+                    this@PrhService, ok = false, kind = "heartbeat",
+                    detail = e.message ?: e.javaClass.simpleName,
+                )
             }
         }
     }
@@ -182,6 +207,11 @@ class PrhService : Service() {
                 cursor = newCursor
                 PrhPrefs.setCursor(this, cursor)
                 backoff = 1000L
+                // Every return counts, including the empty one a 55s long-poll
+                // timeout produces: it means the socket is up and prh answered.
+                // This is what keeps the settings screen's timestamp fresh
+                // while nothing at all is happening.
+                PrhPrefs.recordHeartbeat(this, ok = true, kind = "poll")
 
                 if (events.isNotEmpty()) {
                     Log.i(TAG, "received ${events.size} events at cursor=$cursor")
@@ -196,18 +226,33 @@ class PrhService : Service() {
                 cursor = 0
                 PrhPrefs.setCursor(this, cursor)
                 backoff = 1000L
+                // prh answered, so the connection is healthy — this is a
+                // caught-up problem, not a reachability one.
+                PrhPrefs.recordHeartbeat(this, ok = true, kind = "poll", detail = "cursor reset")
             } catch (e: PrhClient.NotPaired) {
                 // prh does not know this device, so backing off and retrying
                 // would spin forever. Must be caught before IOException — it
                 // is one.
                 Log.e(TAG, "pairing rejected by prh; re-pair from settings", e)
+                PrhPrefs.recordHeartbeat(
+                    this, ok = false, kind = "poll",
+                    detail = "pairing rejected — re-pair from the editor",
+                )
                 return
             } catch (e: IOException) {
                 Log.w(TAG, "poll error: ${e.message}")
+                PrhPrefs.recordHeartbeat(
+                    this, ok = false, kind = "poll",
+                    detail = e.message ?: e.javaClass.simpleName,
+                )
                 delay(backoff)
                 backoff = minOf(backoff * 2, 60_000L)
             } catch (e: Exception) {
                 Log.e(TAG, "unexpected poll error", e)
+                PrhPrefs.recordHeartbeat(
+                    this, ok = false, kind = "poll",
+                    detail = e.message ?: e.javaClass.simpleName,
+                )
                 delay(backoff)
                 backoff = minOf(backoff * 2, 60_000L)
             }
@@ -232,13 +277,20 @@ class PrhService : Service() {
      * msg envelopes never reach the watch — conversation is phone-only and
      * stays off Bluetooth. The conversation view fetches them on demand via
      * GET /v1/sessions/{id}/conversation, so there is nothing to do here.
+     *
+     * Both destinations are switchable from settings. Turning the watch off is
+     * treated exactly like the watch being out of range, so the phone still
+     * gets its notification and the prompt is still answerable — there is no
+     * path here that silently drops a prompt on the floor.
      */
     private fun deliver(envelope: Envelope) {
         if (!envelope.type.crossesBluetooth) {
             return
         }
 
-        val connected = bridge.isConnected()
+        // Read per delivery rather than caching at startup, so flipping the
+        // switch takes effect on the next prompt instead of the next restart.
+        val connected = PrhPrefs.isWatchEnabled(this) && bridge.isConnected()
         Log.i(TAG, "deliver: connected=$connected type=${envelope.type}")
 
         if (envelope.type.needsReply) {
@@ -282,6 +334,12 @@ class PrhService : Service() {
     // -- fallback notification ---------------------------------------------
 
     private fun postAlert(envelope: Envelope) {
+        // Guarded here rather than at the call sites so the switch cannot be
+        // half-applied: every alert this service posts goes through here.
+        if (!PrhPrefs.isPhoneNotificationsEnabled(this)) {
+            Log.d(TAG, "phone notifications off, skipping alert for ${envelope.id}")
+            return
+        }
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         val builder = NotificationCompat.Builder(this, CHANNEL_ALERTS)
             .setContentTitle("[${envelope.project}] ${envelope.title}")
