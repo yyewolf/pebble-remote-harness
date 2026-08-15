@@ -36,6 +36,13 @@ type Config struct {
 	// every VSCode reload anyway. See docs/plugin.md.
 	Upstreams []Upstream `json:"upstreams,omitempty"`
 
+	// CertPath and KeyPath hold the self-signed certificate securing Hop 1.
+	// Defaults sit beside the config. The key is what paired phones pin, so
+	// deleting it forces every device to re-pair; deleting only the
+	// certificate is harmless.
+	CertPath string `json:"cert_path"`
+	KeyPath  string `json:"key_path"`
+
 	// RingSize bounds the per-device replay buffer.
 	RingSize int `json:"ring_size"`
 
@@ -58,6 +65,8 @@ func Default() Config {
 		Listen:         "0.0.0.0:8477",
 		ServerName:     hostname(),
 		SocketPath:     DefaultSocketPath(),
+		CertPath:       defaultStatePath("cert.pem"),
+		KeyPath:        defaultStatePath("key.pem"),
 		RingSize:       200,
 		MaxPollWaitSec: 55,
 	}
@@ -78,6 +87,15 @@ func DefaultSocketPath() string {
 		return "prh.sock"
 	}
 	return home + "/.local/state/prh/plugin.sock"
+}
+
+// defaultStatePath puts TLS material in the same directory as the config.
+func defaultStatePath(name string) string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return name
+	}
+	return dir + "/prh/" + name
 }
 
 // ErrNoPassword means the daemon has never been paired.

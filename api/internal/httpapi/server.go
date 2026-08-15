@@ -36,7 +36,15 @@ type Server struct {
 	// pairing password is the only secret an attacker can guess at, so this
 	// is the only endpoint that needs it.
 	rateLimiter *rateLimiter
+
+	// tlsPin is published on /v1/health so the extension can build a pairing
+	// QR without parsing the certificate itself. Not a secret: every TLS
+	// client is handed the certificate during the handshake.
+	tlsPin string
 }
+
+// SetTLSPin records the pin for /v1/health.
+func (s *Server) SetTLSPin(pin string) { s.tlsPin = pin }
 
 func New(cfg config.Config, h *hub.Hub, devices *auth.Registry, log *slog.Logger) *Server {
 	return &Server{
@@ -44,7 +52,7 @@ func New(cfg config.Config, h *hub.Hub, devices *auth.Registry, log *slog.Logger
 		hub:         h,
 		devices:     devices,
 		log:         log,
-		started:      time.Now(),
+		started:     time.Now(),
 		rateLimiter: newRateLimiter(5, 5*time.Minute),
 	}
 }
@@ -244,6 +252,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Devices:   s.devices.Count(),
 		Sessions:  s.devices.Sessions(),
 		Pairing:   s.devices.PairingOpen(),
+		TLSPin:    s.tlsPin,
 		// Listen lets a second window detect that the running daemon was
 		// started with settings other than its own, and warn rather than
 		// restart a daemon the other windows are using.
@@ -662,10 +671,10 @@ func clientIP(r *http.Request) string {
 // rateLimiter tracks failed attempts per IP within a sliding window. After
 // maxAttempts failures, the IP is locked until the oldest failure expires.
 type rateLimiter struct {
-	mu         sync.Mutex
+	mu          sync.Mutex
 	maxAttempts int
-	window     time.Duration
-	failures   map[string][]time.Time
+	window      time.Duration
+	failures    map[string][]time.Time
 }
 
 func newRateLimiter(maxAttempts int, window time.Duration) *rateLimiter {

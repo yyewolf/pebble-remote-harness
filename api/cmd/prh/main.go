@@ -13,6 +13,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,7 @@ import (
 	"github.com/yyewolf/pebble-remote-harness/api/internal/hub"
 	"github.com/yyewolf/pebble-remote-harness/api/internal/kilo"
 	"github.com/yyewolf/pebble-remote-harness/api/internal/protocol"
+	"github.com/yyewolf/pebble-remote-harness/api/internal/tlsconf"
 )
 
 // version is stamped at build time:
@@ -120,7 +122,17 @@ func run(args []string) error {
 	}
 	log.Info("device registry loaded", "path", devicesPath, "devices", devices.Count())
 
+	// Hop 1 is TLS. There is no CA: the companion pins this certificate's
+	// public key, having learned the expected value from the pairing QR. That
+	// is why regenerating the certificate is safe but deleting the key is not.
+	cert, pin, err := tlsconf.EnsureCert(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return fmt.Errorf("preparing TLS: %w", err)
+	}
+	log.Info("tls certificate ready", "cert", cfg.CertPath, "pin", pin)
+
 	api := httpapi.New(cfg, h, devices, log)
+	api.SetTLSPin(pin)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -152,6 +164,7 @@ func run(args []string) error {
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           api.Handler(),
+		TLSConfig:         &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12},
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: long-poll holds responses open for up to
 		// MaxPollWaitSec. Bound the hold in the handler instead.
@@ -166,8 +179,9 @@ func run(args []string) error {
 		_ = pluginSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Info("prh listening", "addr", cfg.Listen, "version", version, "protocol", protocol.Version)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	log.Info("prh listening", "addr", cfg.Listen, "scheme", "https", "version", version, "protocol", protocol.Version)
+	// Certificates come from TLSConfig, so the file arguments are empty.
+	if err := srv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 
@@ -263,6 +277,14 @@ func pairCommand(args []string) error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
+	// The pin travels with the pairing key, in the same out-of-band hop. A
+	// phone that scanned the code knows both which server to trust and how to
+	// prove itself to it; one that did not knows neither.
+	_, pin, err := tlsconf.EnsureCert(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		return fmt.Errorf("reading the TLS certificate: %w", err)
+	}
+
 	key, err := auth.NewPairingKey()
 	if err != nil {
 		return err
@@ -303,7 +325,7 @@ func pairCommand(args []string) error {
 	}
 
 	fmt.Printf("Pairing open for %d seconds. In the companion app, scan or enter:\n\n", *ttl)
-	fmt.Printf("  prh://%s?k=%s\n\n", addr, encoded)
+	fmt.Printf("  prh://%s?k=%s&f=%s\n\n", addr, encoded, pin)
 	fmt.Println("The window closes as soon as one device enrols.")
 	return nil
 }

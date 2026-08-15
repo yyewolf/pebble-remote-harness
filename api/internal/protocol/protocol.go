@@ -280,6 +280,12 @@ type Health struct {
 	// Pairing reports whether enrolment is currently possible. The fact is
 	// safe to publish; it is what the extension's status bar shows.
 	Pairing bool `json:"pairing"`
+
+	// TLSPin is the base64url SHA-256 of the DER SubjectPublicKeyInfo that
+	// clients pin. Publishing it costs nothing — every TLS client receives the
+	// certificate itself during the handshake — and the extension needs it to
+	// build the pairing QR.
+	TLSPin string `json:"tls_pin,omitempty"`
 	Listen    string `json:"listen"`
 	Paired    bool   `json:"paired"`
 }
