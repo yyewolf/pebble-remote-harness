@@ -12,6 +12,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"path"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,6 +38,88 @@ type pending struct {
 	sessionID string
 }
 
+// sess is the per-session state prh keeps for the phone's session list and
+// conversation view. Built from events, not by calling Kilo, so prh needs no
+// credentials.
+type sess struct {
+	id       string
+	upstream string // which window owns it
+	project  string
+	title    string
+	dir      string
+	status   string // idle | busy | retry | unknown
+	updated  int64  // unix ms
+
+	// convSeq is a cursor space local to this session's conversation, separate
+	// from the global ring's seq. The conversation endpoint filters on it, so
+	// one session's history is served without scanning the global ring.
+	//
+	// A part that is updated is re-stamped with a fresh convSeq while keeping
+	// its slice position, so a long-poller sees the change and a fresh reader
+	// still gets the parts in the order they were created.
+	convSeq  uint64
+	conv     []protocol.Envelope // bounded, creation order, oldest first
+	convSize int
+
+	// pendingPrompt is the envelope ID of an unanswered perm/ques for this
+	// session, so the session list can badge it. Only one is tracked: a
+	// session has at most one outstanding prompt at a time.
+	pendingPrompt     string
+	pendingPromptType protocol.EventType
+
+	convWakers map[chan struct{}]bool // conversation long-pollers
+}
+
+// touch advances the session's last-activity clock. Always monotonic: parts
+// carry their own creation time, and an update to an *old* part must not drag
+// the session backwards in a list sorted by recency.
+func (s *sess) touch(ms int64) {
+	if ms > s.updated {
+		s.updated = ms
+	}
+}
+
+// wake nudges every conversation long-poller. Must be called with mu held.
+func (s *sess) wake() {
+	for ch := range s.convWakers {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// appendConv records an envelope in the session's conversation buffer.
+//
+// Entries are keyed by ID — the part ID for a message, the envelope ID for a
+// prompt — and an entry that already exists is replaced in place, keeping its
+// original position. The agent streams by re-sending the same part with more
+// text, dozens to hundreds of times for one reply, so an append-only buffer
+// would fill with copies of the part currently being written and evict the
+// history behind it: open the view mid-reply and the conversation would be
+// gone. Replacing keeps the buffer's capacity a count of *messages*, which is
+// what it is documented to be.
+//
+// Must be called with mu held.
+func (s *sess) appendConv(env protocol.Envelope) {
+	s.convSeq++
+	env.Seq = s.convSeq
+
+	if env.ID != "" {
+		for i := range s.conv {
+			if s.conv[i].ID == env.ID {
+				s.conv[i] = env
+				return
+			}
+		}
+	}
+
+	s.conv = append(s.conv, env)
+	if len(s.conv) > s.convSize {
+		s.conv = s.conv[len(s.conv)-s.convSize:]
+	}
+}
+
 // upstream is one plugin connection. Its lifetime is the connection's
 // lifetime: when the window closes, the socket drops, and the upstream is
 // removed. The plugin path (M1) registers upstreams here; the fallback SSE
@@ -48,19 +133,31 @@ type upstream struct {
 	// Per-upstream decision queue. The plugin long-polls this; only the
 	// owning upstream's plugin can apply its own decisions, which is the
 	// isolation that stops one window from approving another's prompt.
-	decisions  []protocol.Decision
-	decCursor  uint64
-	decWakers  map[chan struct{}]bool
+	//
+	// decCursor is the *global* decSeq of the newest queued decision, not a
+	// count of this upstream's decisions. Decisions are filtered by the number
+	// embedded in their global ID, so a per-upstream count would not compare
+	// against them: with two windows open the counts fall behind the global
+	// sequence, the plugin echoes back a cursor lower than its own decisions'
+	// IDs, and every decision is redelivered on every poll — forever.
+	decisions []protocol.Decision
+	decCursor uint64
+	decWakers map[chan struct{}]bool
 }
+
+// maxQueuedDecisions bounds one upstream's queue. Decisions are only removed
+// by this trim: the plugin's cursor advancing past them is what retires them
+// logically, but nothing was dropping them from memory.
+const maxQueuedDecisions = 256
 
 // Hub fans upstream events into one ordered stream.
 type Hub struct {
-	mu   sync.RWMutex
-	seq  uint64
-	ring []protocol.Envelope    // bounded, oldest first
-	size int                    // ring capacity
-	open      map[string]pending // envelope ID -> awaiting reply
-	byRequest map[string]string // request_id -> envelope ID (for gone retraction)
+	mu        sync.RWMutex
+	seq       uint64
+	ring      []protocol.Envelope    // bounded, oldest first
+	size      int                    // ring capacity
+	open      map[string]pending     // envelope ID -> awaiting reply
+	byRequest map[string]string      // request_id -> envelope ID (for gone retraction)
 	subs      map[chan struct{}]bool // long-poll wakeups
 
 	clients map[string]*kilo.Client // upstream name -> client (fallback)
@@ -68,6 +165,13 @@ type Hub struct {
 	upstreams map[string]*upstream // plugin upstreams
 	upSeq     uint64
 	decSeq    uint64
+
+	// sessions is the per-session state for the phone's session list and
+	// conversation view. Keyed by Kilo session ID. A session belongs to one
+	// upstream; when that upstream drops, its sessions go too.
+	sessions    map[string]*sess
+	convSize    int // max messages kept per session
+	maxSessions int // registry cap, oldest-by-activity evicted first
 }
 
 // New returns a Hub retaining ringSize envelopes.
@@ -83,6 +187,13 @@ func New(ringSize int) *Hub {
 		subs:      make(map[chan struct{}]bool),
 		clients:   make(map[string]*kilo.Client),
 		upstreams: make(map[string]*upstream),
+		sessions:  make(map[string]*sess),
+		convSize:  50, // keep the last 50 messages per session
+		// A window left open for a week accumulates sessions, each holding up
+		// to convSize envelopes. Nothing else evicts them — Kilo only emits
+		// session.deleted when the user actually deletes a session — so the
+		// registry is capped and the least recently active is dropped.
+		maxSessions: 64,
 	}
 }
 
@@ -132,9 +243,16 @@ func (h *Hub) RegisterUpstream(project, directory string, parentPID int) string 
 }
 
 // RemoveUpstream drops a plugin upstream. Called when the connection drops.
+// Its sessions go too: a session belongs to its window, and the window is
+// gone.
 func (h *Hub) RemoveUpstream(id string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	for sid, s := range h.sessions {
+		if s.upstream == id {
+			delete(h.sessions, sid)
+		}
+	}
 	delete(h.upstreams, id)
 }
 
@@ -162,7 +280,7 @@ func (h *Hub) UpstreamExists(id string) bool {
 // — not the v2 schema. See docs/kilo-integration.md.
 //
 // The bool is needsReply: perm and ques envelopes track a pending request so
-// a reply can route back. idle and err are notify-only.
+// a reply can route back. idle, err, message and session.* are notify-only.
 func (h *Hub) TranslatePluginEvent(project string, ev protocol.PluginEvent) (protocol.Envelope, bool) {
 	switch ev.Kind {
 	case "permission":
@@ -203,6 +321,23 @@ func (h *Hub) TranslatePluginEvent(project string, ev protocol.PluginEvent) (pro
 			Body:    truncate(ev.Description, protocol.MaxBody),
 		}, false
 
+	case "message":
+		// Conversation content. Does not cross Bluetooth; the companion
+		// renders it into its conversation view. The watch never sees it.
+		return protocol.Envelope{
+			Type:    protocol.EventMsg,
+			Project: truncate(project, protocol.MaxProject),
+			Session: ev.SessionID,
+			MsgRole: ev.MsgRole,
+			// A tool part can carry a whole file. prh truncates so that every
+			// consumer sees the same string — the same contract the watch
+			// fields already have.
+			MsgPartID: ev.MsgPartID,
+			MsgText:   truncate(ev.MsgText, protocol.MaxMsgText),
+			MsgKind:   ev.MsgKind,
+			MsgTime:   ev.MsgTimeMs,
+		}, false
+
 	default:
 		return protocol.Envelope{}, false
 	}
@@ -217,26 +352,229 @@ func (h *Hub) IngestPluginEvents(upstreamID, project string, events []protocol.P
 	defer h.mu.Unlock()
 
 	for _, ev := range events {
-		if ev.Kind == "replied" {
+		switch {
+		case ev.Kind == "replied":
 			h.handleRepliedLocked(ev)
-			continue
-		}
-
-		env, needsReply := h.TranslatePluginEvent(project, ev)
-		if env.Type == "" {
-			continue // unrecognized kind, drop
-		}
-
-		env = h.publishLocked(env)
-		if needsReply {
-			h.open[env.ID] = pending{
-				env:       env,
-				upstream:  upstreamID,
-				requestID: ev.RequestID,
-				sessionID: ev.SessionID,
+		case ev.Kind == "message":
+			h.handleMessageLocked(upstreamID, project, ev)
+		case ev.Kind == "session.created":
+			h.handleSessionCreatedLocked(upstreamID, project, ev)
+		case ev.Kind == "session.updated":
+			h.handleSessionUpdatedLocked(upstreamID, project, ev)
+		case ev.Kind == "session.deleted":
+			h.handleSessionDeletedLocked(ev)
+		case ev.Kind == "session.status":
+			h.handleSessionStatusLocked(upstreamID, project, ev)
+		case ev.Kind == "idle":
+			// session.idle doubles as a status update, so the session list
+			// reflects idle even if Kilo never emits session.status.
+			h.handleSessionStatusLocked(upstreamID, project, ev)
+			env, _ := h.TranslatePluginEvent(project, ev)
+			if env.Type != "" {
+				h.publishLocked(env)
 			}
-			h.byRequest[ev.RequestID] = env.ID
+		default:
+			env, needsReply := h.TranslatePluginEvent(project, ev)
+			if env.Type == "" {
+				continue // unrecognized kind, drop
+			}
+
+			env = h.publishLocked(env)
+			if needsReply {
+				h.open[env.ID] = pending{
+					env:       env,
+					upstream:  upstreamID,
+					requestID: ev.RequestID,
+					sessionID: ev.SessionID,
+				}
+				h.byRequest[ev.RequestID] = env.ID
+				h.trackSessionPromptLocked(upstreamID, project, ev.SessionID, env)
+			}
 		}
+	}
+}
+
+// handleMessageLocked records a conversation part in the session's buffer.
+// Must be called with mu held.
+//
+// Deliberately *not* published to the global ring. The ring is the watch's
+// poll stream: it is small, and the companion downloads all of it over mobile
+// data before discarding anything the watch does not need. A streaming reply
+// emits hundreds of part updates, which would (a) burn the phone's data on
+// content the poll path throws away and (b) — the real damage — evict pending
+// permission envelopes from a 200-entry ring before the watch ever polls them.
+// Conversation lives on its own endpoint precisely so it cannot crowd out the
+// prompts this project exists to deliver.
+func (h *Hub) handleMessageLocked(upstreamID, project string, ev protocol.PluginEvent) {
+	env, _ := h.TranslatePluginEvent(project, ev)
+	if env.Type == "" || ev.SessionID == "" {
+		return
+	}
+
+	s := h.getOrCreateSessionLocked(upstreamID, project, ev.SessionID)
+	// The part ID *is* the conversation entry's identity: that is what makes a
+	// streaming update replace its earlier text instead of stacking a partial
+	// on top of it. A part with no ID cannot be deduplicated, so give it a
+	// unique one rather than let it collide with every other anonymous part.
+	env.ID = ev.MsgPartID
+	if env.ID == "" {
+		s.convSeq++
+		env.ID = fmt.Sprintf("part_%d", s.convSeq)
+	}
+	s.appendConv(env)
+	s.touch(ev.MsgTimeMs)
+	s.wake()
+}
+
+// handleSessionCreatedLocked registers a new session from a session.created
+// event. Must be called with mu held.
+func (h *Hub) handleSessionCreatedLocked(upstreamID, project string, ev protocol.PluginEvent) {
+	s := h.getOrCreateSessionLocked(upstreamID, project, ev.SessionID)
+	s.title = truncate(ev.SessionTitle, protocol.MaxTitle)
+	s.dir = ev.SessionDir
+	if ev.SessionUpdatedMs > s.updated {
+		s.updated = ev.SessionUpdatedMs
+	}
+}
+
+// handleSessionUpdatedLocked updates an existing session's metadata. Must be
+// called with mu held.
+func (h *Hub) handleSessionUpdatedLocked(upstreamID, project string, ev protocol.PluginEvent) {
+	s := h.getOrCreateSessionLocked(upstreamID, project, ev.SessionID)
+	if ev.SessionTitle != "" {
+		s.title = truncate(ev.SessionTitle, protocol.MaxTitle)
+	}
+	if ev.SessionDir != "" {
+		s.dir = ev.SessionDir
+	}
+	if ev.SessionUpdatedMs > s.updated {
+		s.updated = ev.SessionUpdatedMs
+	}
+}
+
+// handleSessionDeletedLocked drops a session. Must be called with mu held.
+//
+// Wakes the conversation long-pollers rather than closing their channels: they
+// are owned by the readers, and the next conversationOnce returns
+// ErrUnknownSession, which turns into the 404 the phone already handles by
+// closing the view.
+func (h *Hub) handleSessionDeletedLocked(ev protocol.PluginEvent) {
+	if s, ok := h.sessions[ev.SessionID]; ok {
+		s.wake()
+	}
+	delete(h.sessions, ev.SessionID)
+}
+
+// handleSessionStatusLocked updates a session's status (idle/busy/retry).
+// Must be called with mu held. Used for both session.status and session.idle.
+//
+// Receives the upstreamID and project so a session first seen through a
+// status event (before session.created) still knows which window owns it —
+// without that, Prompt() would find an empty upstream and fail with
+// "session upstream gone".
+func (h *Hub) handleSessionStatusLocked(upstreamID, project string, ev protocol.PluginEvent) {
+	s, ok := h.sessions[ev.SessionID]
+	if !ok {
+		// A status event for an unknown session creates a minimal entry, so
+		// the session list is not blind to a session that started emitting
+		// before its session.created landed.
+		s = h.getOrCreateSessionLocked(upstreamID, project, ev.SessionID)
+	} else {
+		// Keep upstream/project current even on a status update, in case
+		// session.created never arrived or the upstream ID changed after a
+		// window reload.
+		if upstreamID != "" {
+			s.upstream = upstreamID
+		}
+		if project != "" {
+			s.project = project
+		}
+	}
+	switch {
+	case ev.Kind == "session.status" && ev.SessionStatus != "":
+		s.status = ev.SessionStatus
+	case ev.Kind == "idle":
+		s.status = protocol.StatusIdle
+	}
+	s.touch(ev.SessionUpdatedMs)
+	// A status change is what the list is showing; wake anything watching so a
+	// busy session flipping to idle is not held until the poll times out.
+	s.wake()
+}
+
+// trackSessionPromptLocked records that a session has a pending prompt and
+// puts the prompt into the session's conversation, so the phone can badge the
+// row *and* render approve/reject inline under the context that led to it.
+// Must be called with mu held.
+//
+// The session is created if unknown. A permission can easily be the first
+// thing prh hears about a session — the plugin loads mid-session, or prh
+// restarted while the agent was working — and dropping the prompt then would
+// hide exactly the row the user opened the app to find.
+func (h *Hub) trackSessionPromptLocked(upstreamID, project, sessionID string, env protocol.Envelope) {
+	if sessionID == "" {
+		return
+	}
+	s := h.getOrCreateSessionLocked(upstreamID, project, sessionID)
+	s.pendingPrompt = env.ID
+	s.pendingPromptType = env.Type
+
+	// The conversation carries the prompt too. Without this the phone's
+	// approve/reject panel has nothing to render from: the conversation
+	// endpoint is the only thing the view reads.
+	s.appendConv(env)
+	s.touch(nowMs())
+	s.wake()
+}
+
+// getOrCreateSessionLocked returns the session, creating a minimal entry if
+// it does not exist. Must be called with mu held.
+func (h *Hub) getOrCreateSessionLocked(upstreamID, project, sessionID string) *sess {
+	if s, ok := h.sessions[sessionID]; ok {
+		// Keep upstream/project current: a reloaded window re-registers and
+		// re-emits, and the upstream ID may have changed even if the session
+		// is the same.
+		if upstreamID != "" {
+			s.upstream = upstreamID
+		}
+		if project != "" {
+			s.project = project
+		}
+		return s
+	}
+	h.evictSessionsLocked()
+	s := &sess{
+		id:         sessionID,
+		upstream:   upstreamID,
+		project:    project,
+		status:     protocol.StatusUnknown,
+		convSize:   h.convSize,
+		convWakers: make(map[chan struct{}]bool),
+		updated:    nowMs(),
+	}
+	h.sessions[sessionID] = s
+	return s
+}
+
+// evictSessionsLocked makes room for one new session, dropping the least
+// recently active. A session with an unanswered prompt is never evicted: it is
+// the one row the user most needs to find. Must be called with mu held.
+func (h *Hub) evictSessionsLocked() {
+	for len(h.sessions) >= h.maxSessions {
+		var oldestID string
+		var oldest int64
+		for id, s := range h.sessions {
+			if s.pendingPrompt != "" {
+				continue
+			}
+			if oldestID == "" || s.updated < oldest {
+				oldestID, oldest = id, s.updated
+			}
+		}
+		if oldestID == "" {
+			return // every session has a prompt pending; keep them all
+		}
+		delete(h.sessions, oldestID)
 	}
 }
 
@@ -257,12 +595,50 @@ func (h *Hub) handleRepliedLocked(ev protocol.PluginEvent) {
 	delete(h.open, envID)
 	delete(h.byRequest, ev.RequestID)
 
+	h.clearSessionPromptLocked(p.sessionID, envID)
+
 	h.publishLocked(protocol.Envelope{
 		ID:      envID, // same ID so the watch knows which to dismiss
 		Type:    protocol.EventGone,
 		Project: p.env.Project,
 		Session: p.env.Session,
 	})
+}
+
+// clearSessionPromptLocked drops a session's pending-prompt badge and retracts
+// the prompt from its conversation, so the phone's inline approve/reject panel
+// disappears the moment the prompt is settled — wherever it was settled.
+// Must be called with mu held.
+func (h *Hub) clearSessionPromptLocked(sessionID, envID string) {
+	s, ok := h.sessions[sessionID]
+	if !ok {
+		return
+	}
+	if s.pendingPrompt == envID {
+		s.pendingPrompt = ""
+		s.pendingPromptType = ""
+	}
+
+	// Replace the prompt in the conversation with a gone envelope under the
+	// same ID. The phone keys its rendered views by ID, so this updates the
+	// panel in place rather than leaving a dead set of buttons on screen.
+	for i := range s.conv {
+		if s.conv[i].ID != envID {
+			continue
+		}
+		s.convSeq++
+		s.conv[i] = protocol.Envelope{
+			ID:      envID,
+			Seq:     s.convSeq,
+			Type:    protocol.EventGone,
+			Project: s.conv[i].Project,
+			Session: sessionID,
+			Title:   s.conv[i].Title,
+			Body:    s.conv[i].Body,
+		}
+		break
+	}
+	s.wake()
 }
 
 // publishLocked assigns seq and ID, appends to the ring, evicts the oldest if
@@ -324,6 +700,14 @@ func (h *Hub) Poll(ctx context.Context, cursor uint64, wait time.Duration) (prot
 		delete(h.subs, wake)
 		h.mu.Unlock()
 	}()
+
+	// Re-check now that the waker is registered: an envelope published between
+	// the read above and the subscribe woke nobody. For a permission prompt
+	// that is the difference between the watch buzzing now and buzzing when the
+	// poll times out.
+	if resp, err := h.pollOnce(cursor); err != nil || len(resp.Events) > 0 {
+		return resp, err
+	}
 
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
@@ -397,34 +781,52 @@ func (h *Hub) Reply(req protocol.ReplyRequest) error {
 	delete(h.open, req.EventID)
 	delete(h.byRequest, p.requestID)
 
-	h.decSeq++
-	dec := protocol.Decision{
-		ID:        fmt.Sprintf("dec_%d", h.decSeq),
+	// Clear the badge here rather than waiting for Kilo's permission.replied
+	// to come back around. That event is the only other thing that clears it,
+	// and it never arrives if the upstream drops between the reply and the
+	// ack — which would leave the session list advertising a prompt that has
+	// already been answered.
+	h.clearSessionPromptLocked(p.sessionID, req.EventID)
+
+	up, ok := h.upstreams[p.upstream]
+	if !ok {
+		return ErrUpstreamGone
+	}
+
+	h.queueDecisionLocked(up, protocol.Decision{
 		RequestID: p.requestID,
 		SessionID: p.sessionID,
 		Kind:      string(p.env.Type),
 		Action:    req.Action,
 		Choice:    req.Choice,
 		Text:      req.Text,
-		Nonce:     randNonce(),
 		Expires:   p.env.Expires,
-	}
+	})
+	return nil
+}
 
-	up, ok := h.upstreams[p.upstream]
-	if !ok {
-		return ErrAlreadyAnswered // upstream gone
-	}
+// queueDecisionLocked stamps a decision with the global sequence, queues it for
+// one upstream, and wakes that upstream's long-poll. Must be called with mu
+// held.
+func (h *Hub) queueDecisionLocked(up *upstream, dec protocol.Decision) {
+	h.decSeq++
+	dec.ID = fmt.Sprintf("dec_%d", h.decSeq)
+	dec.Nonce = randNonce()
 
 	up.decisions = append(up.decisions, dec)
-	up.decCursor++
+	if len(up.decisions) > maxQueuedDecisions {
+		up.decisions = up.decisions[len(up.decisions)-maxQueuedDecisions:]
+	}
+	// The cursor the plugin echoes back must live in the same number space as
+	// the IDs it is compared against. See the note on upstream.decCursor.
+	up.decCursor = h.decSeq
+
 	for ch := range up.decWakers {
 		select {
 		case ch <- struct{}{}:
 		default:
 		}
 	}
-
-	return nil
 }
 
 // PollDecisions is the downlink long-poll the plugin holds open. Only the
@@ -455,6 +857,12 @@ func (h *Hub) PollDecisions(ctx context.Context, upstreamID string, cursor uint6
 		delete(up.decWakers, wake)
 		h.mu.Unlock()
 	}()
+
+	// Re-check now that the waker is registered — a decision queued in the gap
+	// woke nobody, and an approval should not wait out the poll.
+	if resp, err := h.pollDecisionsOnce(upstreamID, cursor); err != nil || len(resp.Decisions) > 0 {
+		return resp, err
+	}
 
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
@@ -511,13 +919,177 @@ func (h *Hub) AckDecision(upstreamID, decID, status string) {
 	// indicator.
 }
 
-// Prompt forwards dictated text to a session.
+// Prompt forwards dictated text to a session as a prompt decision.
 //
-// TODO: implement in a later milestone. Queue a kind: "prompt" decision for
-// the plugin.
-func (h *Hub) Prompt(ctx context.Context, req protocol.PromptRequest) error {
-	return ErrNotImplemented
+// The plugin applies it via Kilo's prompt_async; prh never holds credentials,
+// so it cannot send the text itself. Same inversion as permission replies.
+//
+// sessionID identifies which session to prompt. We find its upstream and
+// queue a kind:"prompt" decision for that upstream's plugin.
+func (h *Hub) Prompt(sessionID, text string) error {
+	text = truncate(text, protocol.MaxPromptText)
+	if text == "" {
+		return ErrEmptyPrompt
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	s, ok := h.sessions[sessionID]
+	if !ok {
+		return ErrUnknownSession
+	}
+	up, ok := h.upstreams[s.upstream]
+	if !ok {
+		return ErrUpstreamGone
+	}
+
+	h.queueDecisionLocked(up, protocol.Decision{
+		SessionID: sessionID,
+		Kind:      "prompt",
+		Action:    protocol.ActionText,
+		Text:      text,
+	})
+
+	// The phone just gave the session work; reflect that immediately rather
+	// than waiting for the first part to stream back, so the row does not sit
+	// at the bottom of a recency-sorted list right after being used.
+	s.touch(nowMs())
+	s.status = protocol.StatusBusy
+	return nil
 }
+
+// ErrUnknownSession means prh has no record of that session ID.
+var ErrUnknownSession = errors.New("hub: unknown session")
+
+// ErrUpstreamGone means the window that owned the session is no longer
+// connected, so there is no plugin left to apply the decision. Distinct from
+// ErrAlreadyAnswered: nothing was answered, there is simply nowhere to send it.
+var ErrUpstreamGone = errors.New("hub: session upstream gone")
+
+// ErrEmptyPrompt means the text was empty (or whitespace that truncated away).
+var ErrEmptyPrompt = errors.New("hub: empty prompt text")
+
+// Sessions returns a summary of every known session for GET /v1/sessions.
+// Built from the session registry, which is built from events — no Kilo API
+// call.
+func (h *Hub) Sessions() []protocol.SessionSummary {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	out := make([]protocol.SessionSummary, 0, len(h.sessions))
+	for _, s := range h.sessions {
+		summary := protocol.SessionSummary{
+			ID:      s.id,
+			Project: s.project,
+			Title:   s.title,
+			Dir:     dirBase(s.dir),
+			Status:  s.status,
+			Updated: s.updated,
+		}
+		if s.pendingPrompt != "" {
+			summary.HasPrompt = true
+			summary.PromptID = s.pendingPrompt
+			summary.PromptType = string(s.pendingPromptType)
+		}
+		out = append(out, summary)
+	}
+
+	// Map iteration is randomised, so an unsorted list reshuffles on every
+	// refresh. Newest first, with a pending prompt always on top: the row that
+	// needs an answer is the reason the list is open.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].HasPrompt != out[j].HasPrompt {
+			return out[i].HasPrompt
+		}
+		if out[i].Updated != out[j].Updated {
+			return out[i].Updated > out[j].Updated
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// Conversation returns the conversation history for a session after the given
+// per-session cursor, blocking up to wait for new messages. Used by
+// GET /v1/sessions/{id}/conversation.
+func (h *Hub) Conversation(ctx context.Context, sessionID string, cursor uint64, wait time.Duration) (protocol.ConversationResponse, error) {
+	if resp, err := h.conversationOnce(sessionID, cursor); err != nil || len(resp.Events) > 0 || resp.HasMore {
+		return resp, err
+	}
+
+	if wait <= 0 {
+		return h.conversationOnce(sessionID, cursor)
+	}
+
+	// Look up and subscribe under one lock. Split across two, the session can
+	// be deleted in between and the waker lands on an orphaned struct that
+	// nothing will ever signal — the poller then blocks for the full wait
+	// instead of returning "unknown session" straight away.
+	wake := make(chan struct{}, 1)
+	h.mu.Lock()
+	s, ok := h.sessions[sessionID]
+	if ok {
+		s.convWakers[wake] = true
+	}
+	h.mu.Unlock()
+	if !ok {
+		return protocol.ConversationResponse{}, ErrUnknownSession
+	}
+	defer func() {
+		h.mu.Lock()
+		delete(s.convWakers, wake)
+		h.mu.Unlock()
+	}()
+
+	// Re-check now that the waker is registered. A message that landed between
+	// the read above and the subscribe signalled nobody, and without this the
+	// caller would sit out the full wait before noticing it — the agent's reply
+	// appearing on the phone up to a minute late, for no reason.
+	if resp, err := h.conversationOnce(sessionID, cursor); err != nil || len(resp.Events) > 0 || resp.HasMore {
+		return resp, err
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return protocol.ConversationResponse{}, ctx.Err()
+		case <-timer.C:
+			return h.conversationOnce(sessionID, cursor)
+		case <-wake:
+			if resp, err := h.conversationOnce(sessionID, cursor); err != nil || len(resp.Events) > 0 || resp.HasMore {
+				return resp, err
+			}
+		}
+	}
+}
+
+// conversationOnce returns the session's conversation after cursor. Does not
+// block.
+func (h *Hub) conversationOnce(sessionID string, cursor uint64) (protocol.ConversationResponse, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	s, ok := h.sessions[sessionID]
+	if !ok {
+		return protocol.ConversationResponse{}, ErrUnknownSession
+	}
+
+	resp := protocol.ConversationResponse{Cursor: s.convSeq}
+	for _, env := range s.conv {
+		if env.Seq > cursor {
+			resp.Events = append(resp.Events, env)
+		}
+	}
+	return resp, nil
+}
+
+// nowMs is the current time in unix milliseconds, the unit every session and
+// message timestamp on this path uses.
+func nowMs() int64 { return time.Now().UnixMilli() }
 
 // randNonce returns 8 random hex bytes, for decision deduplication.
 func randNonce() string {
@@ -561,4 +1133,22 @@ func truncateChoices(choices []string) []string {
 		out[i] = truncate(c, protocol.MaxChoice)
 	}
 	return out
+}
+
+// dirBase returns the basename of a directory path. Used to label sessions on
+// the phone the same way upstreams are labelled on the watch.
+//
+// path.Base rather than filepath.Base: these paths arrive over the wire from
+// the plugin, so they must be parsed the same way regardless of the OS prh
+// happens to run on. Backslashes are folded first so a Windows path still
+// yields its last component.
+func dirBase(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	b := path.Base(strings.ReplaceAll(dir, `\`, "/"))
+	if b == "." || b == "/" {
+		return ""
+	}
+	return truncate(b, protocol.MaxTitle)
 }

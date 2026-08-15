@@ -89,7 +89,11 @@ func run(args []string) error {
 		return nil
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logLevel := slog.LevelInfo
+	if os.Getenv("PRH_LOG_LEVEL") == "debug" {
+		logLevel = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {

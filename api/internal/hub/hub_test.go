@@ -3,6 +3,8 @@ package hub
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -476,5 +478,346 @@ func TestPollAcceptsACursorAtTheHead(t *testing.T) {
 	}
 	if len(resp.Events) != 0 {
 		t.Fatalf("events = %d, want 0", len(resp.Events))
+	}
+}
+
+// -- conversation + sessions + prompt ---------------------------------------
+
+func TestMessageEnvelopesGoToConversationBuffer(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/home/you/work/infra", 1)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "message", SessionID: "ses_1", MsgRole: "assistant", MsgPartID: "p_1", MsgText: "hello", MsgKind: "text", MsgTimeMs: 1000},
+		{Kind: "message", SessionID: "ses_1", MsgRole: "assistant", MsgPartID: "p_1", MsgText: "hello world", MsgKind: "text", MsgTimeMs: 1100},
+		{Kind: "message", SessionID: "ses_1", MsgRole: "assistant", MsgPartID: "p_2", MsgText: "second", MsgKind: "text", MsgTimeMs: 1200},
+	})
+
+	// Two parts, not three: the second p_1 is the *same* part with more text.
+	// The agent streams by re-sending a growing part, so an append-only buffer
+	// would fill with partials of whatever is being written now and push the
+	// real history out of a 50-entry window.
+	resp, err := h.Conversation(context.Background(), "ses_1", 0, 0)
+	if err != nil {
+		t.Fatalf("conversation: %v", err)
+	}
+	if len(resp.Events) != 2 {
+		t.Fatalf("events = %d, want 2", len(resp.Events))
+	}
+	// Replaced in place: p_1 keeps its position ahead of p_2, with the latest
+	// text.
+	if resp.Events[0].MsgPartID != "p_1" || resp.Events[0].MsgText != "hello world" {
+		t.Errorf("first entry = %q/%q, want p_1/'hello world'",
+			resp.Events[0].MsgPartID, resp.Events[0].MsgText)
+	}
+	if resp.Events[1].MsgPartID != "p_2" {
+		t.Errorf("second entry = %q, want p_2", resp.Events[1].MsgPartID)
+	}
+	// The cursor still counts every update, so a long-poller parked on the
+	// old cursor is woken by an edit to a part it has already seen.
+	if resp.Cursor != 3 {
+		t.Errorf("cursor = %d, want 3", resp.Cursor)
+	}
+}
+
+// A streaming reply must not be able to push the conversation out of the
+// buffer. This is the failure the part-ID keying exists to prevent: open the
+// view while the agent is mid-reply and the history should still be there.
+func TestStreamingPartDoesNotEvictHistory(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/home/you/work/infra", 1)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "message", SessionID: "ses_1", MsgRole: "user", MsgPartID: "p_ask", MsgText: "fix the build", MsgKind: "text"},
+	})
+
+	// One part, updated far more times than the buffer could hold.
+	for i := 0; i < 500; i++ {
+		h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+			{Kind: "message", SessionID: "ses_1", MsgRole: "assistant", MsgPartID: "p_reply", MsgText: strings.Repeat("x", i+1), MsgKind: "text"},
+		})
+	}
+
+	resp, err := h.Conversation(context.Background(), "ses_1", 0, 0)
+	if err != nil {
+		t.Fatalf("conversation: %v", err)
+	}
+	if len(resp.Events) != 2 {
+		t.Fatalf("events = %d, want 2 (the question and the reply)", len(resp.Events))
+	}
+	if resp.Events[0].MsgPartID != "p_ask" {
+		t.Errorf("the question was evicted by its own answer: first entry = %q", resp.Events[0].MsgPartID)
+	}
+}
+
+// Conversation parts are phone-only. Publishing them to the global ring would
+// spend the phone's mobile data on content the poll path discards, and — worse
+// — evict pending permission envelopes from a small ring before the watch ever
+// polls them.
+func TestMessagesStayOutOfTheWatchRing(t *testing.T) {
+	h := New(8)
+	upID := h.RegisterUpstream("infra", "/home/you/work/infra", 1)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "permission", RequestID: "per_1", SessionID: "ses_1", Action: "bash", Resources: []string{"rm -rf /"}},
+	})
+
+	for i := 0; i < 50; i++ {
+		h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+			{Kind: "message", SessionID: "ses_1", MsgPartID: "p_" + strconv.Itoa(i), MsgText: "chatter", MsgKind: "text"},
+		})
+	}
+
+	resp, err := h.Poll(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(resp.Events) != 1 {
+		t.Fatalf("ring holds %d events, want 1 — conversation leaked into the watch stream", len(resp.Events))
+	}
+	if resp.Events[0].Type != protocol.EventPerm {
+		t.Fatalf("the permission was evicted by conversation traffic: type = %q", resp.Events[0].Type)
+	}
+}
+
+// The prompt must reach the conversation, or the phone's inline approve/reject
+// panel has nothing to render: the conversation endpoint is the only thing
+// that view reads.
+func TestPendingPromptReachesTheConversation(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/home/you/work/infra", 1)
+
+	// No session.created first: the permission is the very first thing prh
+	// hears about this session, which is what happens when the plugin loads
+	// mid-session or prh restarts while the agent is working.
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "permission", RequestID: "per_1", SessionID: "ses_1", Action: "bash", Resources: []string{"rm ../fds"}},
+	})
+
+	sessions := h.Sessions()
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1 — a session with a pending prompt is missing from the list", len(sessions))
+	}
+	if !sessions[0].HasPrompt || sessions[0].PromptType != string(protocol.EventPerm) {
+		t.Errorf("summary = %+v, want a pending perm prompt", sessions[0])
+	}
+
+	resp, err := h.Conversation(context.Background(), "ses_1", 0, 0)
+	if err != nil {
+		t.Fatalf("conversation: %v", err)
+	}
+	if len(resp.Events) != 1 || resp.Events[0].Type != protocol.EventPerm {
+		t.Fatalf("conversation = %+v, want the pending permission", resp.Events)
+	}
+
+	// Answering it clears the badge and retracts the prompt from the
+	// conversation, so the panel does not linger with dead buttons.
+	if err := h.Reply(protocol.ReplyRequest{EventID: resp.Events[0].ID, Action: protocol.ActionOnce}); err != nil {
+		t.Fatalf("reply: %v", err)
+	}
+	if sessions := h.Sessions(); sessions[0].HasPrompt {
+		t.Error("badge still set after the prompt was answered")
+	}
+	resp, err = h.Conversation(context.Background(), "ses_1", 0, 0)
+	if err != nil {
+		t.Fatalf("conversation after reply: %v", err)
+	}
+	if len(resp.Events) != 1 || resp.Events[0].Type != protocol.EventGone {
+		t.Fatalf("conversation = %+v, want the prompt retracted as gone", resp.Events)
+	}
+}
+
+// Two windows share one global decision sequence. The cursor the plugin echoes
+// back has to live in that same space, or it lands below its own decisions'
+// IDs and every poll redelivers work that was already applied.
+func TestDecisionCursorSurvivesASecondWindow(t *testing.T) {
+	h := New(50)
+	upA := h.RegisterUpstream("a", "/home/you/a", 1)
+	upB := h.RegisterUpstream("b", "/home/you/b", 2)
+
+	// Three decisions on A push the global sequence ahead of B's own count.
+	for i := 0; i < 3; i++ {
+		h.IngestPluginEvents(upA, "a", []protocol.PluginEvent{
+			{Kind: "permission", RequestID: "per_a" + strconv.Itoa(i), SessionID: "ses_a", Action: "bash", Resources: []string{"ls"}},
+		})
+		resp, _ := h.Poll(context.Background(), uint64(i), 0)
+		if err := h.Reply(protocol.ReplyRequest{EventID: resp.Events[0].ID, Action: protocol.ActionOnce}); err != nil {
+			t.Fatalf("reply on A: %v", err)
+		}
+	}
+
+	h.IngestPluginEvents(upB, "b", []protocol.PluginEvent{
+		{Kind: "message", SessionID: "ses_b", MsgPartID: "p_1", MsgText: "hi", MsgKind: "text"},
+	})
+	if err := h.Prompt("ses_b", "carry on"); err != nil {
+		t.Fatalf("prompt on B: %v", err)
+	}
+
+	resp, err := h.PollDecisions(context.Background(), upB, 0, 0)
+	if err != nil {
+		t.Fatalf("poll decisions: %v", err)
+	}
+	if len(resp.Decisions) != 1 {
+		t.Fatalf("decisions = %d, want 1", len(resp.Decisions))
+	}
+
+	// Poll again with the cursor just handed out. A correct cursor drains the
+	// queue; a per-upstream count would resend the same prompt forever.
+	again, err := h.PollDecisions(context.Background(), upB, resp.Cursor, 0)
+	if err != nil {
+		t.Fatalf("second poll: %v", err)
+	}
+	if len(again.Decisions) != 0 {
+		t.Fatalf("decisions redelivered after acking the cursor: %+v", again.Decisions)
+	}
+}
+
+func TestConversationRespectsCursor(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/home/you/work/infra", 1)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "message", SessionID: "ses_1", MsgPartID: "p_1", MsgText: "a", MsgKind: "text"},
+		{Kind: "message", SessionID: "ses_1", MsgPartID: "p_2", MsgText: "b", MsgKind: "text"},
+	})
+
+	resp, err := h.Conversation(context.Background(), "ses_1", 1, 0)
+	if err != nil {
+		t.Fatalf("conversation: %v", err)
+	}
+	if len(resp.Events) != 1 {
+		t.Fatalf("events = %d, want 1 (only after cursor 1)", len(resp.Events))
+	}
+	if resp.Events[0].MsgText != "b" {
+		t.Errorf("event text = %q, want b", resp.Events[0].MsgText)
+	}
+}
+
+func TestSessionRegistryFromEvents(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/home/you/work/infra", 1)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "session.created", SessionID: "ses_1", SessionTitle: "Fix bug", SessionDir: "/work/infra", SessionUpdatedMs: 5000},
+		{Kind: "session.status", SessionID: "ses_1", SessionStatus: "busy"},
+	})
+
+	sessions := h.Sessions()
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(sessions))
+	}
+	s := sessions[0]
+	if s.ID != "ses_1" {
+		t.Errorf("id = %q, want ses_1", s.ID)
+	}
+	if s.Title != "Fix bug" {
+		t.Errorf("title = %q, want 'Fix bug'", s.Title)
+	}
+	if s.Status != "busy" {
+		t.Errorf("status = %q, want busy", s.Status)
+	}
+	if s.Dir != "infra" {
+		t.Errorf("dir = %q, want infra", s.Dir)
+	}
+}
+
+func TestSessionListBadgesPendingPrompt(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/work/infra", 1)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "session.created", SessionID: "ses_1"},
+		{Kind: "permission", RequestID: "per_1", SessionID: "ses_1", Action: "bash", Resources: []string{"rm -rf build/"}},
+	})
+
+	sessions := h.Sessions()
+	if len(sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(sessions))
+	}
+	if !sessions[0].HasPrompt {
+		t.Fatal("session should badge as having a pending prompt")
+	}
+	if sessions[0].PromptType != "perm" {
+		t.Errorf("prompt type = %q, want perm", sessions[0].PromptType)
+	}
+}
+
+func TestRepliedClearsSessionPromptBadge(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/work/infra", 1)
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "session.created", SessionID: "ses_1"},
+		{Kind: "permission", RequestID: "per_1", SessionID: "ses_1", Action: "bash", Resources: []string{"rm -rf build/"}},
+	})
+	if !h.Sessions()[0].HasPrompt {
+		t.Fatal("expected badge before reply")
+	}
+
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "replied", RequestID: "per_1", SessionID: "ses_1"},
+	})
+	if h.Sessions()[0].HasPrompt {
+		t.Fatal("badge should clear after reply")
+	}
+}
+
+func TestPromptQueuesDecisionForOwningUpstream(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/work/infra", 1)
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "session.created", SessionID: "ses_1"},
+	})
+
+	if err := h.Prompt("ses_1", "run the tests"); err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+
+	resp, err := h.PollDecisions(context.Background(), upID, 0, 0)
+	if err != nil {
+		t.Fatalf("poll decisions: %v", err)
+	}
+	if len(resp.Decisions) != 1 {
+		t.Fatalf("decisions = %d, want 1", len(resp.Decisions))
+	}
+	dec := resp.Decisions[0]
+	if dec.Kind != "prompt" {
+		t.Errorf("kind = %q, want prompt", dec.Kind)
+	}
+	if dec.Text != "run the tests" {
+		t.Errorf("text = %q, want 'run the tests'", dec.Text)
+	}
+	if dec.SessionID != "ses_1" {
+		t.Errorf("session = %q, want ses_1", dec.SessionID)
+	}
+}
+
+func TestPromptUnknownSession(t *testing.T) {
+	h := New(50)
+	if err := h.Prompt("nope", "text"); !errors.Is(err, ErrUnknownSession) {
+		t.Fatalf("err = %v, want ErrUnknownSession", err)
+	}
+}
+
+func TestRemoveUpstreamDropsItsSessions(t *testing.T) {
+	h := New(50)
+	upID := h.RegisterUpstream("infra", "/work/infra", 1)
+	h.IngestPluginEvents(upID, "infra", []protocol.PluginEvent{
+		{Kind: "session.created", SessionID: "ses_1"},
+	})
+
+	h.RemoveUpstream(upID)
+
+	if _, err := h.Conversation(context.Background(), "ses_1", 0, 0); !errors.Is(err, ErrUnknownSession) {
+		t.Fatalf("err = %v, want ErrUnknownSession after upstream removed", err)
+	}
+}
+
+func TestMsgEnvelopesCrossBluetoothFalse(t *testing.T) {
+	if protocol.EventMsg.CrossesBluetooth() {
+		t.Fatal("msg envelopes must not cross Bluetooth")
+	}
+	if !protocol.EventPerm.CrossesBluetooth() {
+		t.Fatal("perm envelopes must cross Bluetooth")
 	}
 }

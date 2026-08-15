@@ -19,13 +19,19 @@ const (
 	EventErr  EventType = "err"  // session.error        -> notify only
 	EventNote EventType = "note" // internal status      -> notify only
 
+	// EventMsg is a conversation message part. It carries what the agent (or
+	// user) is saying, so the phone can show context a 200px screen cannot.
+	// The watch ignores it: this data never crosses Bluetooth.
+	EventMsg EventType = "msg"
+
 	// EventGone retracts a prompt answered elsewhere, e.g. in the VSCode UI.
 	// Driven by Kilo's permission.replied. Without it the watch keeps asking
 	// a question already settled at the desk.
 	EventGone EventType = "gone"
 )
 
-// Wire returns the uint8 the watchapp expects for this type.
+// Wire returns the uint8 the watchapp expects for this type. The watch ignores
+// types it does not recognise, so msg/5-note fall into the default.
 func (t EventType) Wire() uint8 {
 	switch t {
 	case EventPerm:
@@ -38,14 +44,29 @@ func (t EventType) Wire() uint8 {
 		return 4
 	case EventGone:
 		return 6
+	case EventMsg:
+		return 7
 	default:
 		return 5
 	}
 }
 
 // NeedsReply reports whether the watch should present answer affordances.
+// msg envelopes do not: they are context for the phone, not a prompt for the
+// wrist.
 func (t EventType) NeedsReply() bool {
 	return t == EventPerm || t == EventQues
+}
+
+// CrossesBluetooth reports whether the companion forwards this envelope to
+// the watch. msg does not — conversation is phone-only and stays off the
+// slow, snooppable Bluetooth hop.
+func (t EventType) CrossesBluetooth() bool {
+	switch t {
+	case EventPerm, EventQues, EventIdle, EventErr, EventNote, EventGone:
+		return true
+	}
+	return false
 }
 
 // Field limits. prh truncates so that truncation is consistent everywhere;
@@ -56,10 +77,34 @@ const (
 	MaxBody    = 256
 	MaxChoice  = 24
 	MaxChoices = 6
+
+	// MaxMsgText bounds a conversation part. It is far larger than MaxBody
+	// because it renders on a phone rather than a 200px watch screen, but it
+	// is bounded all the same: a tool part can carry a whole file's diff, and
+	// without a cap one `cat` of a large file would sit in memory per session
+	// and be re-sent on every conversation poll.
+	MaxMsgText = 4096
+
+	// MaxPromptText bounds text the phone sends into a session. The phone is
+	// a keyboard, not a file upload.
+	MaxPromptText = 4096
+)
+
+// SessionStatus values reported in SessionSummary.Status.
+const (
+	StatusIdle    = "idle"
+	StatusBusy    = "busy"
+	StatusRetry   = "retry"
+	StatusUnknown = "unknown"
 )
 
 // Envelope is one watch-sized event. Kept small: every field eventually
 // crosses Bluetooth.
+//
+// The Msg* fields are populated only for type == EventMsg and never cross
+// Bluetooth — the companion consumes them for its conversation view and the
+// watch never sees them. Keeping them on the same struct lets one poll stream
+// serve both surfaces without a second endpoint.
 type Envelope struct {
 	ID   string    `json:"id"`
 	Seq  uint64    `json:"seq"`
@@ -78,6 +123,26 @@ type Envelope struct {
 	Body    string   `json:"body"`
 	Choices []string `json:"choices,omitempty"`
 	Expires int64    `json:"expires,omitempty"` // unix seconds
+
+	// -- msg-only fields --------------------------------------------------
+	//
+	// Populated when Type == EventMsg. The companion renders these into a
+	// conversation; the watch never receives them (CrossesBluetooth is
+	// false for EventMsg).
+
+	// MsgRole is "user", "assistant", or "tool" — who said it.
+	MsgRole string `json:"msg_role,omitempty"`
+	// MsgPartID identifies the part within the message, for replace/update.
+	MsgPartID string `json:"msg_part_id,omitempty"`
+	// MsgText is the accumulated text of the part. A part may be updated many
+	// times as the agent streams; the latest text replaces the prior.
+	MsgText string `json:"msg_text,omitempty"`
+	// MsgKind labels the part for the UI: "text", "reasoning", "tool",
+	// "step-start", "file", "patch". Lets the phone render tool calls and
+	// reasoning distinctly from prose.
+	MsgKind string `json:"msg_kind,omitempty"`
+	// MsgTime is the part's created/updated time in unix milliseconds.
+	MsgTime int64 `json:"msg_time,omitempty"`
 }
 
 // ReplyAction is how the user answered.
@@ -264,6 +329,48 @@ type PromptRequest struct {
 	Text    string `json:"text"`
 }
 
+// -- sessions + conversation (phone UI) --------------------------------------
+//
+// These endpoints let the companion show what is happening across every
+// window and reply to a session from the phone. They are signed like the rest
+// of Hop 1; the conversation data never crosses Bluetooth.
+
+// SessionSummary is one entry in GET /v1/sessions. Built from events, not by
+// calling Kilo, so prh needs no credentials.
+type SessionSummary struct {
+	ID         string `json:"id"`
+	Project    string `json:"project"`               // which window owns it
+	Title      string `json:"title"`                 // Kilo's session title, truncated
+	Dir        string `json:"dir"`                   // working directory basename
+	Status     string `json:"status"`                // idle | busy | retry | unknown
+	Updated    int64  `json:"updated"`               // unix ms, last activity
+	HasPrompt  bool   `json:"has_prompt"`            // a perm/ques envelope is pending
+	PromptID   string `json:"prompt_id,omitempty"`   // the pending envelope id
+	PromptType string `json:"prompt_type,omitempty"` // perm | ques
+}
+
+// SessionsResponse answers GET /v1/sessions.
+type SessionsResponse struct {
+	Sessions []SessionSummary `json:"sessions"`
+}
+
+// ConversationResponse answers GET /v1/sessions/{id}/conversation. Messages
+// are returned newest-last; the cursor is the seq of the last envelope the
+// caller has seen, so a follow-up long-poll fetches only newer ones.
+type ConversationResponse struct {
+	Cursor  uint64     `json:"cursor"`
+	Events  []Envelope `json:"events"`
+	HasMore bool       `json:"has_more,omitempty"`
+}
+
+// SessionPromptRequest is the body of POST /v1/sessions/{id}/prompt. It
+// becomes a kind:"prompt" decision routed to the owning plugin, which calls
+// Kilo's prompt_async. prh never holds Kilo credentials, so it cannot send
+// the text itself — same inversion as permission replies.
+type SessionPromptRequest struct {
+	Text string `json:"text"`
+}
+
 // Health is the unauthenticated liveness payload. Must never carry secrets.
 //
 // Listen and Bind let a second VSCode window notice that the running daemon
@@ -286,8 +393,8 @@ type Health struct {
 	// certificate itself during the handshake — and the extension needs it to
 	// build the pairing QR.
 	TLSPin string `json:"tls_pin,omitempty"`
-	Listen    string `json:"listen"`
-	Paired    bool   `json:"paired"`
+	Listen string `json:"listen"`
+	Paired bool   `json:"paired"`
 }
 
 // -- Hop 0: the plugin channel, served on a unix socket ---------------------
@@ -313,8 +420,14 @@ type PluginHelloResponse struct {
 //
 // Field names follow Kilo's live permission.asked payload rather than its v2
 // schema, because v1 is what actually fires. See docs/kilo-integration.md.
+//
+// The Kind space grew beyond permission/question/idle/error to carry what the
+// agent is saying and the session lifecycle, so the phone can show context
+// and a session list.
 type PluginEvent struct {
-	// Kind is permission | question | idle | error | replied.
+	// Kind is permission | question | idle | error | replied |
+	// message | session.created | session.updated | session.deleted |
+	// session.status.
 	Kind      string `json:"kind"`
 	RequestID string `json:"request_id"`
 	SessionID string `json:"session_id"`
@@ -333,6 +446,39 @@ type PluginEvent struct {
 	// the command. "ls -la" approved with always grants "ls *". Show it, or
 	// the user consents to more than they read.
 	Always []string `json:"always,omitempty"`
+
+	// -- message + session lifecycle -------------------------------------
+	//
+	// Populated for kind == "message". The plugin forwards the accumulated
+	// part text, not per-token deltas: volume stays bounded and the phone's
+	// view is always current without a streaming protocol.
+
+	// MsgRole: "user", "assistant", or "tool".
+	MsgRole string `json:"msg_role,omitempty"`
+	// MsgPartID identifies the part within its message.
+	MsgPartID string `json:"msg_part_id,omitempty"`
+	// MsgText is the part's accumulated text.
+	MsgText string `json:"msg_text,omitempty"`
+	// MsgKind is the part type: "text", "reasoning", "tool", "step-start",
+	// "file", "patch".
+	MsgKind string `json:"msg_kind,omitempty"`
+	// MsgTimeMs is the part's timestamp in unix milliseconds.
+	MsgTimeMs int64 `json:"msg_time_ms,omitempty"`
+
+	// -- session lifecycle -----------------------------------------------
+	//
+	// Populated for kind == "session.*". The plugin forwards what Kilo emits
+	// in session.created/updated/deleted (a Session struct) and session.status
+	// (idle/busy/retry).
+
+	// SessionTitle is Kilo's session title, e.g. "Fix the login bug".
+	SessionTitle string `json:"session_title,omitempty"`
+	// SessionDir is the session's working directory, full path.
+	SessionDir string `json:"session_dir,omitempty"`
+	// SessionStatus is "idle" | "busy" | "retry" for session.status.
+	SessionStatus string `json:"session_status,omitempty"`
+	// SessionUpdatedMs is the session's last-updated time in unix ms.
+	SessionUpdatedMs int64 `json:"session_updated_ms,omitempty"`
 }
 
 type PluginEvents struct {

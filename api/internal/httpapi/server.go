@@ -70,6 +70,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/poll", s.signed(s.handlePoll))
 	mux.HandleFunc("POST /v1/reply", s.signed(s.handleReply))
 	mux.HandleFunc("POST /v1/prompt", s.signed(s.handlePrompt))
+	mux.HandleFunc("GET /v1/sessions", s.signed(s.handleSessions))
+	mux.HandleFunc("GET /v1/sessions/{id}/conversation", s.signed(s.handleConversation))
+	mux.HandleFunc("POST /v1/sessions/{id}/prompt", s.signed(s.handleSessionPrompt))
 
 	return mux
 }
@@ -94,6 +97,7 @@ func (s *Server) PluginHandler() http.Handler {
 	mux.HandleFunc("POST /admin/v1/pairing", s.handleOpenPairing)
 	mux.HandleFunc("DELETE /admin/v1/pairing", s.handleClosePairing)
 	mux.HandleFunc("GET /admin/v1/pairing", s.handlePairingStatus)
+	mux.HandleFunc("GET /admin/v1/debug/sessions", s.handleDebugSessions)
 
 	return mux
 }
@@ -147,6 +151,11 @@ func (s *Server) handlePairingStatus(w http.ResponseWriter, r *http.Request) {
 		status.ExpiresAt = s.devices.PairingExpiry().Unix()
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+// handleDebugSessions dumps the session registry. Unix socket only.
+func (s *Server) handleDebugSessions(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.hub.Sessions())
 }
 
 // handlePluginHello registers one kilo server, keyed by (parent_pid,
@@ -205,10 +214,11 @@ func (s *Server) handlePluginEvents(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePluginDecisions(w http.ResponseWriter, r *http.Request) {
 	upstreamID := r.URL.Query().Get("upstream_id")
 	if upstreamID == "" || !s.hub.UpstreamExists(upstreamID) {
+		// Routine after a prh restart: the plugin re-hellos on the 400.
+		s.log.Debug("plugin decisions poll: unknown upstream", "upstream_id", upstreamID)
 		writeErr(w, http.StatusBadRequest, "unknown upstream_id")
 		return
 	}
-
 	cursor, _ := strconv.ParseUint(r.URL.Query().Get("cursor"), 10, 64)
 	waitSec := s.cfg.MaxPollWaitSec
 	if q := r.URL.Query().Get("wait"); q != "" {
@@ -220,14 +230,20 @@ func (s *Server) handlePluginDecisions(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.hub.PollDecisions(r.Context(), upstreamID, cursor, time.Duration(waitSec)*time.Second)
 	if err != nil {
 		switch {
-		case errors.Is(err, hub.ErrAlreadyAnswered):
+		case errors.Is(err, hub.ErrAlreadyAnswered), errors.Is(err, hub.ErrUpstreamGone):
 			writeErr(w, http.StatusGone, "upstream gone")
-		case errors.Is(err, context.Canceled):
-			writeJSON(w, http.StatusOK, protocol.DecisionsResponse{Cursor: 0, Decisions: nil})
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// Echo the caller's cursor. Answering 0 rewinds the plugin to the
+			// start of the queue, and it re-applies every decision it has
+			// already applied — approvals included.
+			writeJSON(w, http.StatusOK, protocol.DecisionsResponse{Cursor: cursor})
 		default:
 			writeErr(w, http.StatusInternalServerError, "poll error")
 		}
 		return
+	}
+	if len(resp.Decisions) > 0 {
+		s.log.Debug("decisions delivered", "upstream_id", upstreamID, "count", len(resp.Decisions), "cursor", resp.Cursor)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -239,6 +255,7 @@ func (s *Server) handlePluginAck(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	s.log.Debug("plugin ack", "upstream_id", req.UpstreamID, "id", req.ID, "status", req.Status)
 	s.hub.AckDecision(req.UpstreamID, req.ID, req.Status)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
@@ -523,13 +540,95 @@ func (s *Server) handleReply(w http.ResponseWriter, r *http.Request, dev *auth.D
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handlePrompt forwards dictated text as new work.
+// handlePrompt forwards dictated text as new work. Kept for the watch's
+// dictation path; the phone's per-session reply uses
+// /v1/sessions/{id}/prompt, which routes to the same hub.Prompt.
 func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request, dev *auth.Device) {
 	var req protocol.PromptRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	writeErr(w, http.StatusNotImplemented, "prompt not implemented")
+	if req.Session == "" {
+		writeErr(w, http.StatusBadRequest, "missing session")
+		return
+	}
+	s.writePromptResult(w, req.Session, req.Text)
+}
+
+// handleSessions lists every known session for the phone's session view.
+func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request, dev *auth.Device) {
+	s.log.Debug("sessions list", "device_id", dev.ID)
+	writeJSON(w, http.StatusOK, protocol.SessionsResponse{
+		Sessions: s.hub.Sessions(),
+	})
+}
+
+// writePromptResult queues text for a session and maps the hub's errors onto
+// statuses the phone can act on: 404 means the session is gone (close the
+// view), 409 means the window went away (retrying will not help), 400 means
+// the text was empty.
+func (s *Server) writePromptResult(w http.ResponseWriter, sessionID, text string) {
+	switch err := s.hub.Prompt(sessionID, text); {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case errors.Is(err, hub.ErrUnknownSession):
+		writeErr(w, http.StatusNotFound, "unknown session")
+	case errors.Is(err, hub.ErrUpstreamGone):
+		writeErr(w, http.StatusConflict, "session upstream gone")
+	case errors.Is(err, hub.ErrEmptyPrompt):
+		writeErr(w, http.StatusBadRequest, "empty text")
+	default:
+		s.log.Error("prompt failed", "session_id", sessionID, "err", err)
+		writeErr(w, http.StatusInternalServerError, "prompt failed")
+	}
+}
+
+// handleConversation returns a session's conversation history, long-polling
+// for new messages. The cursor is the per-session seq of the last envelope
+// the caller has seen.
+func (s *Server) handleConversation(w http.ResponseWriter, r *http.Request, dev *auth.Device) {
+	sessionID := r.PathValue("id")
+	cursor, _ := strconv.ParseUint(r.URL.Query().Get("cursor"), 10, 64)
+	waitSec := s.cfg.MaxPollWaitSec
+	if q := r.URL.Query().Get("wait"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n >= 0 && n < waitSec {
+			waitSec = n
+		}
+	}
+	s.log.Debug("conversation poll", "session_id", sessionID, "cursor", cursor, "device_id", dev.ID)
+
+	resp, err := s.hub.Conversation(r.Context(), sessionID, cursor, time.Duration(waitSec)*time.Second)
+	if err != nil {
+		switch {
+		case errors.Is(err, hub.ErrUnknownSession):
+			writeErr(w, http.StatusNotFound, "unknown session")
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// The phone hung up or the poll deadline passed mid-wait. Echoing
+			// the caller's own cursor keeps it where it was; returning 0 would
+			// rewind it and replay the whole conversation on the next poll.
+			writeJSON(w, http.StatusOK, protocol.ConversationResponse{Cursor: cursor})
+		default:
+			writeErr(w, http.StatusInternalServerError, "conversation error")
+		}
+		return
+	}
+	s.log.Debug("conversation response", "session_id", sessionID, "events", len(resp.Events), "cursor", resp.Cursor)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleSessionPrompt sends text into a session from the phone — the "reply in
+// sessions" affordance. Routes to hub.Prompt, which queues a kind:"prompt"
+// decision for the owning plugin to apply via Kilo's prompt_async.
+func (s *Server) handleSessionPrompt(w http.ResponseWriter, r *http.Request, dev *auth.Device) {
+	sessionID := r.PathValue("id")
+	var req protocol.SessionPromptRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// Length, not content, is logged: this is the user's message to their own
+	// agent and prh has no business recording it.
+	s.log.Info("session prompt from phone", "session_id", sessionID, "device_id", dev.ID, "text_len", len(req.Text))
+	s.writePromptResult(w, sessionID, req.Text)
 }
 
 // authedFunc is a handler that has already resolved a device.
