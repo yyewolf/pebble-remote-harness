@@ -3,11 +3,14 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -27,21 +30,86 @@ func newTestServer(t *testing.T, passwordHash string) *Server {
 	return New(cfg, h, devices, slog.New(slog.DiscardHandler))
 }
 
-func doJSON(t *testing.T, srv *Server, method, path string, body any, token string) *httptest.ResponseRecorder {
+// signer holds what a paired companion holds: a key ID and the key itself.
+// nil means an unauthenticated request.
+type signer struct {
+	keyID string
+	key   []byte
+
+	// nonce is fixed when a test wants to prove a replay is refused.
+	nonce string
+	// skew shifts the signed date to exercise the leeway check.
+	skew time.Duration
+}
+
+// registerAndLogin does what the companion does on first run: pair with the
+// passphrase, then trade the device secret for a session key.
+func registerAndLogin(t *testing.T, srv *Server) *signer {
 	t.Helper()
-	var r io.Reader
+	dev, err := srv.devices.Register("dev", "android")
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	sess, _, err := srv.devices.NewSession(dev.ID)
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	return &signer{keyID: sess.KeyID, key: sess.Key}
+}
+
+// deviceSigner signs with the device secret, which is what POST /v1/login
+// requires.
+func deviceSigner(t *testing.T, srv *Server, deviceID string) *signer {
+	t.Helper()
+	key, err := srv.devices.DeviceKey(deviceID)
+	if err != nil {
+		t.Fatalf("device key: %v", err)
+	}
+	return &signer{keyID: deviceID, key: key}
+}
+
+func randNonce(t *testing.T) string {
+	t.Helper()
+	raw := make([]byte, protocol.NonceMinLen)
+	if _, err := rand.Read(raw); err != nil {
+		t.Fatal(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+func doJSON(t *testing.T, srv *Server, method, path string, body any, s *signer) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf []byte
 	if body != nil {
-		buf, err := json.Marshal(body)
+		var err error
+		buf, err = json.Marshal(body)
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+
+	var r io.Reader
+	if buf != nil {
 		r = bytes.NewReader(buf)
 	}
 	req := httptest.NewRequest(method, path, r)
 	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+
+	if s != nil {
+		nonce := s.nonce
+		if nonce == "" {
+			nonce = randNonce(t)
+		}
+		date := strconv.FormatInt(time.Now().Add(s.skew).Unix(), 10)
+		req.Header.Set(protocol.HeaderKeyID, s.keyID)
+		req.Header.Set(protocol.HeaderDate, date)
+		req.Header.Set(protocol.HeaderNonce, nonce)
+		// RequestURI on the server side is path+query, which is what the
+		// middleware canonicalises; mirror it exactly or every test 401s.
+		req.Header.Set(protocol.HeaderSig, auth.Sign(s.key,
+			auth.Canonical(method, path, date, nonce, buf)))
 	}
+
 	w := httptest.NewRecorder()
 	srv.Handler().ServeHTTP(w, req)
 	return w
@@ -66,7 +134,7 @@ func doPluginJSON(t *testing.T, srv *Server, method, path string, body any) *htt
 
 func TestHandleHealth(t *testing.T) {
 	srv := newTestServer(t, "")
-	w := doJSON(t, srv, "GET", "/v1/health", nil, "")
+	w := doJSON(t, srv, "GET", "/v1/health", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
@@ -89,7 +157,7 @@ func TestHandleRegister(t *testing.T) {
 		Password:   "secret",
 		DeviceName: "Pixel",
 		Platform:   "android",
-	}, "")
+	}, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
 	}
@@ -97,8 +165,8 @@ func TestHandleRegister(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.Token == "" {
-		t.Error("empty token")
+	if resp.DeviceSecret == "" {
+		t.Error("empty device secret")
 	}
 	if resp.DeviceID == "" {
 		t.Error("empty device ID")
@@ -110,7 +178,7 @@ func TestHandleRegisterBadPassword(t *testing.T) {
 
 	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
 		Password: "wrong",
-	}, "")
+	}, nil)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
@@ -121,23 +189,23 @@ func TestHandleRegisterUnpaired(t *testing.T) {
 
 	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
 		Password: "anything",
-	}, "")
+	}, nil)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
 }
 
-func TestHandlePollNoToken(t *testing.T) {
+func TestHandlePollUnsigned(t *testing.T) {
 	srv := newTestServer(t, "plain:secret")
-	w := doJSON(t, srv, "GET", "/v1/poll?cursor=0", nil, "")
+	w := doJSON(t, srv, "GET", "/v1/poll?cursor=0", nil, nil)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
 }
 
-func TestHandlePollBadToken(t *testing.T) {
+func TestHandlePollUnknownKey(t *testing.T) {
 	srv := newTestServer(t, "plain:secret")
-	w := doJSON(t, srv, "GET", "/v1/poll?cursor=0", nil, "prh_bogus")
+	w := doJSON(t, srv, "GET", "/v1/poll?cursor=0", nil, &signer{keyID: "key_bogus", key: []byte("nope")})
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
@@ -145,9 +213,9 @@ func TestHandlePollBadToken(t *testing.T) {
 
 func TestHandlePollEmpty(t *testing.T) {
 	srv := newTestServer(t, "plain:secret")
-	_, token, _ := srv.devices.Register("dev", "android")
+	sign := registerAndLogin(t, srv)
 
-	w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, token)
+	w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
@@ -193,8 +261,8 @@ func TestHandlePollEvents(t *testing.T) {
 	}
 
 	// Register a device and poll.
-	_, token, _ := srv.devices.Register("dev", "android")
-	w = doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, token)
+	sign := registerAndLogin(t, srv)
+	w = doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign)
 	if w.Code != http.StatusOK {
 		t.Fatalf("poll status = %d", w.Code)
 	}
@@ -247,9 +315,9 @@ func TestHandlePollGoneCursor(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		srv.hub.Publish(protocol.Envelope{Type: protocol.EventNote})
 	}
-	_, token, _ := srv.devices.Register("dev", "android")
+	sign := registerAndLogin(t, srv)
 
-	w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, token)
+	w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign)
 	if w.Code != http.StatusGone {
 		t.Fatalf("status = %d, want 410", w.Code)
 	}
@@ -257,11 +325,11 @@ func TestHandlePollGoneCursor(t *testing.T) {
 
 func TestHandlePollLongPollWakes(t *testing.T) {
 	srv := newTestServer(t, "plain:secret")
-	_, token, _ := srv.devices.Register("dev", "android")
+	sign := registerAndLogin(t, srv)
 
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		done <- doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=3", nil, token)
+		done <- doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=3", nil, sign)
 	}()
 
 	time.Sleep(100 * time.Millisecond)
@@ -284,10 +352,17 @@ func TestHandlePollLongPollWakes(t *testing.T) {
 
 func TestHandlePollContextCancel(t *testing.T) {
 	srv := newTestServer(t, "plain:secret")
-	_, token, _ := srv.devices.Register("dev", "android")
+	sign := registerAndLogin(t, srv)
 
-	req := httptest.NewRequest("GET", "/v1/poll?cursor=0&wait=5", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
+	const path = "/v1/poll?cursor=0&wait=5"
+	req := httptest.NewRequest("GET", path, nil)
+	nonce := randNonce(t)
+	date := strconv.FormatInt(time.Now().Unix(), 10)
+	req.Header.Set(protocol.HeaderKeyID, sign.keyID)
+	req.Header.Set(protocol.HeaderDate, date)
+	req.Header.Set(protocol.HeaderNonce, nonce)
+	req.Header.Set(protocol.HeaderSig, auth.Sign(sign.key, auth.Canonical("GET", path, date, nonce, nil)))
+
 	ctx, cancel := context.WithCancel(req.Context())
 	req = req.WithContext(ctx)
 	w := httptest.NewRecorder()
@@ -333,8 +408,8 @@ func TestReplyAndPluginDecisions(t *testing.T) {
 	})
 
 	// Register a device and poll to get the event ID.
-	_, token, _ := srv.devices.Register("dev", "android")
-	w = doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, token)
+	sign := registerAndLogin(t, srv)
+	w = doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign)
 	var pollResp protocol.PollResponse
 	json.Unmarshal(w.Body.Bytes(), &pollResp)
 	if len(pollResp.Events) != 1 {
@@ -346,7 +421,7 @@ func TestReplyAndPluginDecisions(t *testing.T) {
 	w = doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
 		EventID: envID,
 		Action:  protocol.ActionOnce,
-	}, token)
+	}, sign)
 	if w.Code != http.StatusOK {
 		t.Fatalf("reply status = %d, body %s", w.Code, w.Body.String())
 	}
@@ -404,8 +479,8 @@ func TestReplyAlreadyAnswered(t *testing.T) {
 		}},
 	})
 
-	_, token, _ := srv.devices.Register("dev", "android")
-	w = doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, token)
+	sign := registerAndLogin(t, srv)
+	w = doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign)
 	var pollResp protocol.PollResponse
 	json.Unmarshal(w.Body.Bytes(), &pollResp)
 	envID := pollResp.Events[0].ID
@@ -414,7 +489,7 @@ func TestReplyAlreadyAnswered(t *testing.T) {
 	w = doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
 		EventID: envID,
 		Action:  protocol.ActionOnce,
-	}, token)
+	}, sign)
 	if w.Code != http.StatusOK {
 		t.Fatalf("first reply = %d", w.Code)
 	}
@@ -423,7 +498,7 @@ func TestReplyAlreadyAnswered(t *testing.T) {
 	w = doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
 		EventID: envID,
 		Action:  protocol.ActionAlways,
-	}, token)
+	}, sign)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("second reply = %d, want 409", w.Code)
 	}
@@ -431,12 +506,12 @@ func TestReplyAlreadyAnswered(t *testing.T) {
 
 func TestReplyUnknownEvent(t *testing.T) {
 	srv := newTestServer(t, "plain:secret")
-	_, token, _ := srv.devices.Register("dev", "android")
+	sign := registerAndLogin(t, srv)
 
 	w := doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
 		EventID: "evt_bogus",
 		Action:  protocol.ActionOnce,
-	}, token)
+	}, sign)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", w.Code)
 	}
@@ -447,7 +522,7 @@ func TestReplyNoToken(t *testing.T) {
 	w := doJSON(t, srv, "POST", "/v1/reply", protocol.ReplyRequest{
 		EventID: "evt_1",
 		Action:  protocol.ActionOnce,
-	}, "")
+	}, nil)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
@@ -470,7 +545,7 @@ func TestRegisterRateLimited(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
 			Password: "wrong",
-		}, "")
+		}, nil)
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("attempt %d: status = %d, want 401", i, w.Code)
 		}
@@ -479,7 +554,7 @@ func TestRegisterRateLimited(t *testing.T) {
 	// 4th attempt should be locked out.
 	w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
 		Password: "secret",
-	}, "")
+	}, nil)
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", w.Code)
 	}
@@ -493,7 +568,7 @@ func TestRegisterRateLimitResetOnSuccess(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
 			Password: "wrong",
-		}, "")
+		}, nil)
 	}
 
 	// Correct password succeeds and resets.
@@ -501,7 +576,7 @@ func TestRegisterRateLimitResetOnSuccess(t *testing.T) {
 		Password:   "secret",
 		DeviceName: "dev",
 		Platform:   "android",
-	}, "")
+	}, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
@@ -510,9 +585,232 @@ func TestRegisterRateLimitResetOnSuccess(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		w := doJSON(t, srv, "POST", "/v1/register", protocol.RegisterRequest{
 			Password: "wrong",
-		}, "")
+		}, nil)
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("post-reset attempt %d: status = %d, want 401", i, w.Code)
 		}
+	}
+}
+
+// --- request signing ------------------------------------------------------
+
+// The property that replaced bearer tokens: capturing a request must not let
+// you send it again. Without this, one sniffed poll on an open network is a
+// permanent licence to approve shell commands.
+func TestSignedRequestCannotBeReplayed(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	sign := registerAndLogin(t, srv)
+	sign.nonce = randNonce(t) // pin it, so the second call is byte-identical
+
+	if w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign); w.Code != http.StatusOK {
+		t.Fatalf("first request: status = %d, body %s", w.Code, w.Body.String())
+	}
+	if w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign); w.Code != http.StatusUnauthorized {
+		t.Fatalf("replay: status = %d, want 401", w.Code)
+	}
+}
+
+// A stale capture is refused even with a fresh nonce, which bounds how long a
+// recording stays dangerous to the leeway window.
+func TestSignedRequestOutsideLeewayIsRejected(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+
+	for _, tc := range []struct {
+		name string
+		skew time.Duration
+	}{
+		{"stale", -(protocol.ClockLeewaySec + 5) * time.Second},
+		{"future", (protocol.ClockLeewaySec + 5) * time.Second},
+	} {
+		sign := registerAndLogin(t, srv)
+		sign.skew = tc.skew
+		w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", tc.name, w.Code)
+		}
+		// The client needs our clock to correct itself, or a drifting phone
+		// fails forever with what looks like a credential error.
+		if w.Header().Get(protocol.HeaderServerTime) == "" {
+			t.Errorf("%s: no %s header on a skew rejection", tc.name, protocol.HeaderServerTime)
+		}
+	}
+}
+
+// Signing the method and path is what stops a captured poll from being
+// rewritten into an approval.
+func TestSignatureCannotBeMovedToAnotherRoute(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	sign := registerAndLogin(t, srv)
+
+	nonce := randNonce(t)
+	date := strconv.FormatInt(time.Now().Unix(), 10)
+	// A legitimate signature over a harmless GET.
+	sig := auth.Sign(sign.key, auth.Canonical("GET", "/v1/poll?cursor=0&wait=0", date, nonce, nil))
+
+	body, _ := json.Marshal(protocol.ReplyRequest{EventID: "evt_1", Action: protocol.ActionOnce})
+	req := httptest.NewRequest("POST", "/v1/reply", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(protocol.HeaderKeyID, sign.keyID)
+	req.Header.Set(protocol.HeaderDate, date)
+	req.Header.Set(protocol.HeaderNonce, nonce)
+	req.Header.Set(protocol.HeaderSig, sig)
+
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 — a poll signature approved a command", w.Code)
+	}
+}
+
+// The body is signed, so an approval cannot be edited in flight.
+func TestTamperedBodyIsRejected(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	sign := registerAndLogin(t, srv)
+
+	nonce := randNonce(t)
+	date := strconv.FormatInt(time.Now().Unix(), 10)
+	signed, _ := json.Marshal(protocol.ReplyRequest{EventID: "evt_1", Action: protocol.ActionReject})
+	sig := auth.Sign(sign.key, auth.Canonical("POST", "/v1/reply", date, nonce, signed))
+
+	// Same signature, but the decision has been flipped to an approval.
+	tampered, _ := json.Marshal(protocol.ReplyRequest{EventID: "evt_1", Action: protocol.ActionAlways})
+	req := httptest.NewRequest("POST", "/v1/reply", bytes.NewReader(tampered))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(protocol.HeaderKeyID, sign.keyID)
+	req.Header.Set(protocol.HeaderDate, date)
+	req.Header.Set(protocol.HeaderNonce, nonce)
+	req.Header.Set(protocol.HeaderSig, sig)
+
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 — a reject was turned into an always", w.Code)
+	}
+}
+
+// --- login and heartbeat --------------------------------------------------
+
+func TestLoginIssuesAWrappedSession(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	dev, err := srv.devices.Register("Pixel", "android")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := doJSON(t, srv, "POST", "/v1/login", protocol.LoginRequest{DeviceID: dev.ID},
+		deviceSigner(t, srv, dev.ID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	var resp protocol.LoginResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	for name, v := range map[string]string{
+		"key_id":      resp.KeyID,
+		"wrap_salt":   resp.WrapSalt,
+		"wrap_nonce":  resp.WrapNonce,
+		"wrapped_key": resp.WrappedKey,
+	} {
+		if v == "" {
+			t.Errorf("empty %s", name)
+		}
+	}
+	if resp.ExpiresAt <= time.Now().Unix() {
+		t.Error("session already expired")
+	}
+}
+
+func TestLoginRequiresTheDeviceSecret(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	dev, _ := srv.devices.Register("Pixel", "android")
+
+	// Right device ID, wrong key.
+	w := doJSON(t, srv, "POST", "/v1/login", protocol.LoginRequest{DeviceID: dev.ID},
+		&signer{keyID: dev.ID, key: []byte("not the secret")})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+}
+
+// A session key is only good for the device that proved it owns the secret.
+func TestLoginBodyMustMatchTheSigningKey(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	mine, _ := srv.devices.Register("mine", "android")
+	theirs, _ := srv.devices.Register("theirs", "android")
+
+	w := doJSON(t, srv, "POST", "/v1/login", protocol.LoginRequest{DeviceID: theirs.ID},
+		deviceSigner(t, srv, mine.ID))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestLoginUnknownDevice(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	w := doJSON(t, srv, "POST", "/v1/login", protocol.LoginRequest{DeviceID: "dev_nope"},
+		&signer{keyID: "dev_nope", key: []byte("whatever")})
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestHeartbeatConfirmsALiveSession(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	sign := registerAndLogin(t, srv)
+
+	w := doJSON(t, srv, "POST", "/v1/heartbeat", nil, sign)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	var resp protocol.HeartbeatResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK {
+		t.Error("ok = false")
+	}
+	if resp.ExpiresAt == 0 {
+		t.Error("no session expiry reported")
+	}
+	if resp.ServerTime == 0 {
+		t.Error("no server time reported; clients cannot measure skew")
+	}
+}
+
+// The restart case the heartbeat exists for: sessions are memory-only, so a
+// fresh registry rejects the old key and the companion knows to log in again.
+func TestHeartbeatFailsAfterSessionsAreLost(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	sign := registerAndLogin(t, srv)
+
+	if w := doJSON(t, srv, "POST", "/v1/heartbeat", nil, sign); w.Code != http.StatusOK {
+		t.Fatalf("before restart: status = %d", w.Code)
+	}
+
+	// What a restart looks like from the client's side: same devices, no
+	// sessions.
+	srv.devices = auth.NewRegistry("plain:secret")
+
+	if w := doJSON(t, srv, "POST", "/v1/heartbeat", nil, sign); w.Code != http.StatusUnauthorized {
+		t.Fatalf("after restart: status = %d, want 401", w.Code)
+	}
+}
+
+// Revocation has to bite immediately, not when the session key expires.
+func TestRevokedDeviceLosesAccessAtOnce(t *testing.T) {
+	srv := newTestServer(t, "plain:secret")
+	dev, _ := srv.devices.Register("Pixel", "android")
+	sess, _, _ := srv.devices.NewSession(dev.ID)
+	sign := &signer{keyID: sess.KeyID, key: sess.Key}
+
+	if w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign); w.Code != http.StatusOK {
+		t.Fatalf("before revoke: status = %d", w.Code)
+	}
+	if err := srv.devices.Revoke(dev.ID); err != nil {
+		t.Fatal(err)
+	}
+	if w := doJSON(t, srv, "GET", "/v1/poll?cursor=0&wait=0", nil, sign); w.Code != http.StatusUnauthorized {
+		t.Fatalf("after revoke: status = %d, want 401", w.Code)
 	}
 }

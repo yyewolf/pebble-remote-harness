@@ -96,7 +96,17 @@ func run(args []string) error {
 		log.Info("upstream configured", "name", up.Name, "url", up.BaseURL)
 	}
 
-	devices := auth.NewRegistry(cfg.PasswordHash)
+	// Device secrets are persisted beside the config. Losing this file is not
+	// fatal but it is not silent either: every paired device would have to be
+	// re-paired with the passphrase, so a corrupt file is an error rather than
+	// an empty registry that looks like a fresh install.
+	devicesPath := auth.DefaultDevicesPath(*configPath)
+	devices, err := auth.LoadRegistry(devicesPath, cfg.PasswordHash)
+	if err != nil {
+		return fmt.Errorf("loading devices: %w", err)
+	}
+	log.Info("device registry loaded", "path", devicesPath, "devices", devices.Count())
+
 	api := httpapi.New(cfg, h, devices, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

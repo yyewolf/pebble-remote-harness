@@ -226,6 +226,9 @@ type Health struct {
 	UptimeSec int64  `json:"uptime_sec"`
 	Upstreams int    `json:"upstreams"`
 	Devices   int    `json:"devices"`
+	// Sessions is how many devices currently hold a valid signing key. It
+	// drops to zero on restart, which is the condition heartbeats repair.
+	Sessions int `json:"sessions"`
 	Listen    string `json:"listen"`
 	Paired    bool   `json:"paired"`
 }

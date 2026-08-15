@@ -120,6 +120,30 @@ func Verify(key []byte, canonical, sig string) error {
 	return ErrBadSignature
 }
 
+// NonceUsed reports whether this key has already presented this nonce.
+func (r *Registry) NonceUsed(keyID, nonce string, now time.Time) bool {
+	return r.nonces.used(keyID, nonce, now)
+}
+
+// RememberNonce records an accepted nonce. Call it only after the signature
+// has verified — see nonceCache.remember.
+func (r *Registry) RememberNonce(keyID, nonce string, now time.Time) {
+	r.nonces.remember(keyID, nonce, now)
+}
+
+// DeviceKey returns a device's signing key. It is the only way out of this
+// package for a device secret, and exists solely so the HTTP layer can verify
+// the login signature.
+func (r *Registry) DeviceKey(deviceID string) ([]byte, error) {
+	r.mu.RLock()
+	d, ok := r.devices[deviceID]
+	r.mu.RUnlock()
+	if !ok {
+		return nil, ErrBadDevice
+	}
+	return d.key()
+}
+
 // nonceCache remembers recently-accepted nonces so that a request captured
 // inside the leeway window still cannot be replayed.
 //

@@ -4,9 +4,11 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -50,11 +52,15 @@ func New(cfg config.Config, h *hub.Hub, devices *auth.Registry, log *slog.Logger
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	// Only health and register are unauthenticated, and register is the only
+	// one that accepts a secret. Everything else is signed.
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("POST /v1/register", s.handleRegister)
-	mux.HandleFunc("GET /v1/poll", s.authed(s.handlePoll))
-	mux.HandleFunc("POST /v1/reply", s.authed(s.handleReply))
-	mux.HandleFunc("POST /v1/prompt", s.authed(s.handlePrompt))
+	mux.HandleFunc("POST /v1/login", s.handleLogin)
+	mux.HandleFunc("POST /v1/heartbeat", s.signed(s.handleHeartbeat))
+	mux.HandleFunc("GET /v1/poll", s.signed(s.handlePoll))
+	mux.HandleFunc("POST /v1/reply", s.signed(s.handleReply))
+	mux.HandleFunc("POST /v1/prompt", s.signed(s.handlePrompt))
 
 	return mux
 }
@@ -176,6 +182,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		UptimeSec: int64(time.Since(s.started).Seconds()),
 		Upstreams: s.hub.Upstreams(),
 		Devices:   s.devices.Count(),
+		Sessions:  s.devices.Sessions(),
 		// Listen lets a second window detect that the running daemon was
 		// started with settings other than its own, and warn rather than
 		// restart a daemon the other windows are using.
@@ -220,18 +227,96 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// mistyped a few times is not penalised after a successful pairing.
 	s.rateLimiter.reset(ip)
 
-	deviceID, token, err := s.devices.Register(req.DeviceName, req.Platform)
+	dev, err := s.devices.Register(req.DeviceName, req.Platform)
 	if err != nil {
+		// Register only fails if the secret could not be generated or could
+		// not be persisted. Both mean the pairing would not survive, so do not
+		// hand back a secret that is about to be forgotten.
+		s.log.Error("registration failed", "err", err)
 		writeErr(w, http.StatusInternalServerError, "registration failed")
 		return
 	}
-	s.log.Info("device registered", "device_id", deviceID, "name", req.DeviceName)
+	s.log.Info("device registered", "device_id", dev.ID, "name", req.DeviceName)
 
+	// The only time the device secret is ever transmitted.
 	writeJSON(w, http.StatusOK, protocol.RegisterResponse{
-		DeviceID:   deviceID,
-		Token:      token,
+		DeviceID:     dev.ID,
+		DeviceSecret: dev.Secret,
+		ServerName:   s.cfg.ServerName,
+	})
+}
+
+// handleLogin issues a session key to a device that proves possession of its
+// device secret by signing this request with it.
+//
+// The passphrase is deliberately not involved. It crossed the wire once, at
+// registration, and never needs to again — which is what lets the companion
+// recover from a prh restart on its own, with nothing for the user to retype.
+//
+// No rate limit here: unlike the passphrase, a device secret is 32 random
+// bytes, so there is nothing to guess at and every forgery attempt is rejected
+// by a constant-time HMAC comparison.
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	hdr, ok := s.verifySignature(w, r, s.devices.DeviceKey)
+	if !ok {
+		return
+	}
+
+	var req protocol.LoginRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// The signing key already identifies the device; requiring the body to
+	// agree keeps a signed login from being replayed against a different
+	// device's registration.
+	if req.DeviceID != hdr.KeyID {
+		writeErr(w, http.StatusBadRequest, "device_id does not match signing key")
+		return
+	}
+
+	_, wrapped, err := s.devices.NewSession(hdr.KeyID)
+	if err != nil {
+		s.log.Error("session creation failed", "device_id", hdr.KeyID, "err", err)
+		writeErr(w, http.StatusInternalServerError, "login failed")
+		return
+	}
+	s.log.Info("session issued", "device_id", hdr.KeyID, "key_id", wrapped.KeyID)
+
+	writeJSON(w, http.StatusOK, protocol.LoginResponse{
+		KeyID:      wrapped.KeyID,
+		WrapSalt:   wrapped.WrapSalt,
+		WrapNonce:  wrapped.WrapNonce,
+		WrappedKey: wrapped.WrappedKey,
+		ExpiresAt:  wrapped.Expires.Unix(),
 		ServerName: s.cfg.ServerName,
 	})
+}
+
+// handleHeartbeat confirms a session is still usable.
+//
+// Its value is entirely in the failure case: a 401 here is the companion's
+// signal that prh restarted and dropped its sessions, so it should log in
+// again. Without it that discovery only happens when a prompt is already
+// waiting, which is the worst moment to find out.
+func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, dev *auth.Device) {
+	writeJSON(w, http.StatusOK, protocol.HeartbeatResponse{
+		OK: true,
+		// ServerTime doubles as a skew check while things are working, so a
+		// drifting clock can be corrected before it starts costing 401s.
+		ServerTime: time.Now().Unix(),
+		ExpiresAt:  s.sessionExpiry(r),
+	})
+}
+
+// sessionExpiry reports when the signing session ends, or 0 if it cannot be
+// resolved — the heartbeat has already succeeded by this point, so a missing
+// expiry is informational rather than an error.
+func (s *Server) sessionExpiry(r *http.Request) int64 {
+	sess, err := s.devices.Session(r.Header.Get(protocol.HeaderKeyID))
+	if err != nil {
+		return 0
+	}
+	return sess.Expires.Unix()
 }
 
 // handlePoll is the long-poll. It blocks up to wait seconds for events after
@@ -305,37 +390,104 @@ func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request, dev *auth.
 // authedFunc is a handler that has already resolved a device.
 type authedFunc func(http.ResponseWriter, *http.Request, *auth.Device)
 
-// authed resolves the bearer token before dispatching.
+// signed dispatches only requests carrying a valid session signature.
 //
-// Tokens are sent as `Authorization: Bearer prh_...`. A missing or unknown
-// token gets 401 — the safe failure direction.
-func (s *Server) authed(next authedFunc) http.HandlerFunc {
+// This replaced bearer tokens. A bearer token is replayed verbatim on every
+// request, so on an unencrypted LAN one captured poll hands an attacker
+// permanent authority to approve shell commands. A signature proves possession
+// of a key that never crosses the wire, and proves it for that request alone.
+func (s *Server) signed(next authedFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r)
-		if token == "" {
-			writeErr(w, http.StatusUnauthorized, "missing bearer token")
+		var session *auth.Session
+		hdr, ok := s.verifySignature(w, r, func(keyID string) ([]byte, error) {
+			sess, err := s.devices.Session(keyID)
+			if err != nil {
+				return nil, err
+			}
+			session = sess
+			return sess.Key, nil
+		})
+		if !ok {
 			return
 		}
-		dev, err := s.devices.Authenticate(token)
+		_ = hdr
+
+		// The session outlived its device only if the device was revoked
+		// mid-session, which Revoke already handles; this is the belt to that
+		// braces. A revoked phone must stop approving immediately.
+		dev, err := s.devices.Device(session.DeviceID)
 		if err != nil {
-			writeErr(w, http.StatusUnauthorized, "invalid or revoked token")
+			writeErr(w, http.StatusUnauthorized, "device revoked")
 			return
 		}
 		next(w, r, dev)
 	}
 }
 
-// bearerToken extracts the token from an Authorization header.
-func bearerToken(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if h == "" {
-		return ""
+// verifySignature performs the checks common to every signed route and, on
+// success, leaves r.Body readable by the handler.
+//
+// Order matters. Cheap, non-secret checks run first so that malformed traffic
+// costs nothing; the nonce is only recorded after the signature verifies, or
+// an observer could burn a nonce belonging to a request they cannot forge and
+// deny it to the real client.
+func (s *Server) verifySignature(
+	w http.ResponseWriter,
+	r *http.Request,
+	keyFor func(keyID string) ([]byte, error),
+) (auth.SigHeaders, bool) {
+	hdr, err := auth.ParseSigHeaders(r.Header.Get)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "malformed signature headers")
+		return hdr, false
 	}
-	const prefix = "Bearer "
-	if !strings.HasPrefix(h, prefix) {
-		return ""
+
+	now := time.Now()
+	if err := auth.CheckDate(hdr.Date, now); err != nil {
+		// Answer with our clock so a client with a drifting one can measure
+		// the offset and retry, instead of failing forever with a 401 that
+		// looks like a credential problem. The time is not a secret.
+		w.Header().Set(protocol.HeaderServerTime, strconv.FormatInt(now.Unix(), 10))
+		writeErr(w, http.StatusUnauthorized, "request date outside leeway")
+		return hdr, false
 	}
-	return strings.TrimSpace(h[len(prefix):])
+
+	if s.devices.NonceUsed(hdr.KeyID, hdr.Nonce, now) {
+		writeErr(w, http.StatusUnauthorized, "nonce already used")
+		return hdr, false
+	}
+
+	key, err := keyFor(hdr.KeyID)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "unknown or expired key")
+		return hdr, false
+	}
+
+	body, ok := readBody(w, r)
+	if !ok {
+		return hdr, false
+	}
+
+	if err := auth.Verify(key, auth.Canonical(r.Method, r.URL.RequestURI(), hdr.Date, hdr.Nonce, body), hdr.Sig); err != nil {
+		writeErr(w, http.StatusUnauthorized, "bad signature")
+		return hdr, false
+	}
+
+	s.devices.RememberNonce(hdr.KeyID, hdr.Nonce, now)
+	return hdr, true
+}
+
+// readBody buffers the body so it can be hashed, then puts it back for the
+// handler to decode. The cap matches decodeJSON's.
+func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	defer r.Body.Close()
+	buf, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "unreadable request body")
+		return nil, false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(buf))
+	return buf, true
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

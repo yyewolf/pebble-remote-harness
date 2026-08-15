@@ -1,15 +1,27 @@
-// Package auth handles the pairing password and per-device tokens.
+// Package auth handles the pairing passphrase, per-device secrets, and the
+// session keys that sign requests.
 //
-// Two distinct secrets, deliberately not shared:
-//   - the pairing password: typed once in the companion, stored hashed here
-//   - a device token: issued at registration, revocable, used for every call
+// Three secrets, deliberately not shared, each crossing the wire as rarely as
+// it can:
+//   - the pairing passphrase: typed once in the companion, argon2id-hashed
+//     here, and transmitted exactly once per device
+//   - a device secret: issued at registration, persisted on both sides, and
+//     never transmitted again — it only signs
+//   - a session key: wrapped under the device secret at login, held in memory
+//     only, and likewise only ever signs
 //
-// Kilo's own KILO_SERVER_PASSWORD is a third secret that never leaves the box.
+// Kilo's own KILO_SERVER_PASSWORD is a fourth secret that never leaves the box.
+//
+// Note the asymmetry with the previous bearer-token design: verifying an HMAC
+// requires the key, so device secrets are stored in plaintext rather than
+// hashed. That trade is deliberate and is argued in docs/protocol.md — Hop 1
+// is unencrypted HTTP on a LAN, where a credential replayed on every request
+// is a far larger exposure than one sitting in a 0600 file on a machine an
+// attacker would already have to own.
 package auth
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
@@ -25,31 +37,61 @@ import (
 var (
 	ErrNotImplemented = errors.New("auth: not implemented")
 	ErrBadPassword    = errors.New("auth: bad password")
-	ErrBadToken       = errors.New("auth: unknown or revoked token")
+	ErrBadDevice      = errors.New("auth: unknown or revoked device")
+	ErrBadSession     = errors.New("auth: unknown or expired session")
 	ErrRateLimited    = errors.New("auth: too many attempts")
 )
 
 // Device is one registered companion.
 type Device struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Platform   string    `json:"platform"`
-	TokenHash  string    `json:"token_hash"` // never store the token itself
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Platform string `json:"platform"`
+
+	// Secret is the base64url device secret, 32 random bytes. Stored in
+	// plaintext because HMAC verification needs the key itself; see the
+	// package comment. This is why devices.json is 0600 and why Redacted()
+	// exists for anything that leaves the process.
+	Secret string `json:"secret"`
+
 	Registered time.Time `json:"registered"`
 	LastSeen   time.Time `json:"last_seen"`
 }
 
-// Registry owns devices and verifies credentials.
+// Redacted returns a copy safe to log or serve. Every path that exposes a
+// Device outside this package must go through it.
+func (d *Device) Redacted() Device {
+	c := *d
+	c.Secret = ""
+	return c
+}
+
+// key decodes the device secret for use as an HMAC key.
+func (d *Device) key() ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(d.Secret)
+}
+
+// Registry owns devices and sessions and verifies credentials.
 type Registry struct {
 	mu           sync.RWMutex
 	passwordHash string
-	devices      map[string]*Device // keyed by device ID
+	devices      map[string]*Device  // keyed by device ID
+	sessions     map[string]*Session // keyed by session key ID
+
+	// path is where devices are persisted. Empty disables persistence, which
+	// is what the tests use.
+	path string
+
+	// nonces backs replay rejection for signed requests.
+	nonces *nonceCache
 }
 
 func NewRegistry(passwordHash string) *Registry {
 	return &Registry{
 		passwordHash: passwordHash,
 		devices:      make(map[string]*Device),
+		sessions:     make(map[string]*Session),
+		nonces:       newNonceCache(),
 	}
 }
 
@@ -171,35 +213,34 @@ func verifyArgon2id(encoded, plaintext string) error {
 	return ErrBadPassword
 }
 
-// hashToken returns a base64url SHA-256 digest of a token. Device tokens are
-// high-entropy (32 random bytes) so SHA-256 is sufficient — unlike the pairing
-// password, which is user-chosen and needs argon2id.
-func hashToken(token string) string {
-	sum := sha256.Sum256([]byte(token))
-	return base64.RawURLEncoding.EncodeToString(sum[:])
+// randomID returns a prefixed, base64url-encoded random identifier.
+func randomID(prefix string, n int) (string, error) {
+	raw := make([]byte, n)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("auth: generating %s id: %w", prefix, err)
+	}
+	return prefix + base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
-// Register issues a new device token. The plaintext token is returned exactly
-// once; only its hash is retained.
-func (r *Registry) Register(name, platform string) (deviceID, token string, err error) {
+// Register issues a new device secret. The secret is returned to the caller
+// exactly once — it is stored here so that HMACs can be verified, but it is
+// never sent over the wire again, and no endpoint reads it back out.
+func (r *Registry) Register(name, platform string) (*Device, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
-		return "", "", fmt.Errorf("auth: generating token: %w", err)
+		return nil, fmt.Errorf("auth: generating device secret: %w", err)
 	}
-	token = "prh_" + base64.RawURLEncoding.EncodeToString(raw)
-
-	rawID := make([]byte, 8)
-	if _, err := rand.Read(rawID); err != nil {
-		return "", "", fmt.Errorf("auth: generating device id: %w", err)
+	deviceID, err := randomID("dev_", 8)
+	if err != nil {
+		return nil, err
 	}
-	deviceID = "dev_" + base64.RawURLEncoding.EncodeToString(rawID)
 
 	now := time.Now()
 	d := &Device{
 		ID:         deviceID,
 		Name:       name,
 		Platform:   platform,
-		TokenHash:  hashToken(token),
+		Secret:     base64.RawURLEncoding.EncodeToString(raw),
 		Registered: now,
 		LastSeen:   now,
 	}
@@ -208,44 +249,45 @@ func (r *Registry) Register(name, platform string) (deviceID, token string, err 
 	r.devices[deviceID] = d
 	r.mu.Unlock()
 
-	return deviceID, token, nil
-}
-
-// Authenticate resolves a bearer token to a device and bumps LastSeen.
-func (r *Registry) Authenticate(token string) (*Device, error) {
-	h := hashToken(token)
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	for _, d := range r.devices {
-		if subtle.ConstantTimeCompare([]byte(d.TokenHash), []byte(h)) == 1 {
-			d.LastSeen = time.Now()
-			return d, nil
-		}
+	// A device that is not persisted stops working at the next restart, which
+	// is precisely the failure the persistence exists to prevent. Report the
+	// error rather than handing back a secret that will not survive.
+	if err := r.persist(); err != nil {
+		return nil, err
 	}
-	return nil, ErrBadToken
+	return d, nil
 }
 
-// Revoke drops a device. Called from the VSCode extension.
+// Revoke drops a device and every session it holds.
+//
+// Dropping the sessions is the part that matters: leaving them alive would
+// mean a revoked phone keeps approving commands until its session key expires.
 func (r *Registry) Revoke(deviceID string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if _, ok := r.devices[deviceID]; !ok {
+		r.mu.Unlock()
 		return fmt.Errorf("auth: unknown device %s", deviceID)
 	}
 	delete(r.devices, deviceID)
-	return nil
+	for id, s := range r.sessions {
+		if s.DeviceID == deviceID {
+			delete(r.sessions, id)
+		}
+	}
+	r.mu.Unlock()
+
+	return r.persist()
 }
 
-// List returns registered devices, for the extension's status view.
-func (r *Registry) List() []*Device {
+// List returns redacted devices, for the extension's status view. The secret
+// is stripped: this crosses a process boundary.
+func (r *Registry) List() []Device {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	out := make([]*Device, 0, len(r.devices))
+	out := make([]Device, 0, len(r.devices))
 	for _, d := range r.devices {
-		out = append(out, d)
+		out = append(out, d.Redacted())
 	}
 	return out
 }

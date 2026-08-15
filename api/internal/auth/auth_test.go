@@ -1,61 +1,99 @@
 package auth
 
 import (
+	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 )
 
-func TestRegisterAndAuthenticate(t *testing.T) {
+func TestRegisterIssuesAUsableSecret(t *testing.T) {
 	r := NewRegistry("plain:test")
-	deviceID, token, err := r.Register("Pixel 8", "android")
+	dev, err := r.Register("Pixel 8", "android")
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if deviceID == "" || token == "" {
-		t.Fatal("empty device ID or token")
-	}
-	if token[:4] != "prh_" {
-		t.Errorf("token prefix = %q, want prh_", token[:4])
+	if dev.ID == "" || dev.Secret == "" {
+		t.Fatal("empty device ID or secret")
 	}
 
-	dev, err := r.Authenticate(token)
+	// 32 bytes, or the HMAC key is weaker than the hash it feeds.
+	raw, err := base64.RawURLEncoding.DecodeString(dev.Secret)
 	if err != nil {
-		t.Fatalf("authenticate: %v", err)
+		t.Fatalf("secret is not base64url: %v", err)
 	}
-	if dev.ID != deviceID {
-		t.Errorf("device ID = %q, want %q", dev.ID, deviceID)
+	if len(raw) != 32 {
+		t.Errorf("secret is %d bytes, want 32", len(raw))
 	}
-	if dev.Name != "Pixel 8" {
-		t.Errorf("name = %q, want Pixel 8", dev.Name)
+
+	got, err := r.Device(dev.ID)
+	if err != nil {
+		t.Fatalf("device lookup: %v", err)
+	}
+	if got.Name != "Pixel 8" {
+		t.Errorf("name = %q, want Pixel 8", got.Name)
 	}
 	if r.Count() != 1 {
 		t.Errorf("count = %d, want 1", r.Count())
 	}
 }
 
-func TestAuthenticateBadToken(t *testing.T) {
+func TestRegisterSecretsAreDistinct(t *testing.T) {
 	r := NewRegistry("plain:test")
-	_, _, _ = r.Register("dev", "android")
-
-	_, err := r.Authenticate("prh_bogus")
-	if err != ErrBadToken {
-		t.Fatalf("err = %v, want ErrBadToken", err)
+	a, _ := r.Register("a", "android")
+	b, _ := r.Register("b", "android")
+	if a.Secret == b.Secret {
+		t.Fatal("two devices got the same secret")
 	}
 }
 
-func TestRevoke(t *testing.T) {
+// The secret must not escape via any listing path — that is the whole reason
+// Redacted exists.
+func TestListRedactsSecrets(t *testing.T) {
 	r := NewRegistry("plain:test")
-	deviceID, token, _ := r.Register("dev", "android")
+	dev, _ := r.Register("Pixel 8", "android")
 
-	if err := r.Revoke(deviceID); err != nil {
+	for _, d := range r.List() {
+		if d.Secret != "" {
+			t.Fatalf("List leaked the device secret for %s", d.ID)
+		}
+	}
+	if dev.Secret == "" {
+		t.Fatal("Redacted mutated the stored device")
+	}
+}
+
+func TestDeviceUnknown(t *testing.T) {
+	r := NewRegistry("plain:test")
+	if _, err := r.Device("dev_nope"); !errors.Is(err, ErrBadDevice) {
+		t.Fatalf("err = %v, want ErrBadDevice", err)
+	}
+}
+
+// Revoking must kill live sessions too, or a revoked phone keeps approving
+// commands until its key expires.
+func TestRevokeDropsSessions(t *testing.T) {
+	r := NewRegistry("plain:test")
+	dev, _ := r.Register("dev", "android")
+	sess, _, err := r.NewSession(dev.ID)
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	if _, err := r.Session(sess.KeyID); err != nil {
+		t.Fatalf("session not usable before revoke: %v", err)
+	}
+
+	if err := r.Revoke(dev.ID); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 	if r.Count() != 0 {
 		t.Errorf("count = %d after revoke, want 0", r.Count())
 	}
-	_, err := r.Authenticate(token)
-	if err != ErrBadToken {
-		t.Fatalf("authenticate after revoke: err = %v, want ErrBadToken", err)
+	if _, err := r.Session(sess.KeyID); !errors.Is(err, ErrBadSession) {
+		t.Fatalf("session survived revocation: err = %v", err)
+	}
+	if _, err := r.DeviceKey(dev.ID); !errors.Is(err, ErrBadDevice) {
+		t.Fatalf("device key survived revocation: err = %v", err)
 	}
 }
 
