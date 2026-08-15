@@ -6,4 +6,7 @@
     <string name="alerts_channel">Prompts</string>
     <string name="scan_button">Scan pairing code</string>
     <string name="scan_prompt">Point the camera at the pairing code in the editor</string>
+    <string name="sessions_button">Sessions</string>
+    <string name="sessions_title">Sessions</string>
+    <string name="conversation_title">Conversation</string>
 </resources>

@@ -57,6 +57,14 @@ class PrhClient(
      */
     class PairingClosed(message: String) : IOException(message)
 
+    /**
+     * prh has no record of that session: it was deleted, or prh restarted and
+     * lost its in-memory registry. Distinct from [NotPaired] — the device's
+     * credentials are fine — so the conversation view can close itself without
+     * telling the user to re-pair.
+     */
+    class UnknownSession(message: String) : IOException(message)
+
     private var sessionKeyId: String? = null
     private var sessionKey: ByteArray? = null
 
@@ -190,6 +198,11 @@ class PrhClient(
                             (0 until ca.length()).map { ci -> ca.getString(ci) }
                         } ?: emptyList(),
                         expires = o.optLong("expires", 0),
+                        msgRole = o.optString("msg_role", ""),
+                        msgPartID = o.optString("msg_part_id", ""),
+                        msgText = o.optString("msg_text", ""),
+                        msgKind = o.optString("msg_kind", ""),
+                        msgTime = o.optLong("msg_time", 0),
                     )
                 }
                 newCursor to events
@@ -248,6 +261,102 @@ class PrhClient(
 
         val resp = authed("POST", "/v1/prompt", body)
         if (resp.code == 501) return@withContext // not implemented yet, by design
+        if (resp.code !in 200..299) throw HttpException(resp.code, "prompt failed: ${resp.body}")
+    }
+
+    /**
+     * Lists every known session. GET /v1/sessions.
+     *
+     * Built by prh from events, not by calling Kilo, so this needs no
+     * credentials beyond the device's signing key. The [hasPrompt] flag is
+     * what the session list badges — it is set when a perm/ques envelope for
+     * that session is still pending.
+     */
+    suspend fun sessions(): List<SessionSummary> = withContext(Dispatchers.IO) {
+        val resp = authed("GET", "/v1/sessions", null)
+        if (resp.code !in 200..299) {
+            throw HttpException(resp.code, "sessions failed: ${resp.body}")
+        }
+        val json = JSONObject(resp.body.ifEmpty { "{}" })
+        val arr = json.optJSONArray("sessions") ?: JSONArray()
+        (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            SessionSummary(
+                id = o.getString("id"),
+                project = o.optString("project", ""),
+                title = o.optString("title", ""),
+                dir = o.optString("dir", ""),
+                status = o.optString("status", "unknown"),
+                updated = o.optLong("updated", 0),
+                hasPrompt = o.optBoolean("has_prompt", false),
+                promptId = o.optString("prompt_id", ""),
+                promptType = o.optString("prompt_type", ""),
+            )
+        }
+    }
+
+    /**
+     * Long-polls a session's conversation. GET /v1/sessions/{id}/conversation.
+     *
+     * Returns the per-session cursor and the messages newer than it. The
+     * cursor is the seq of the last message the caller has seen, so a
+     * follow-up call fetches only what arrived since.
+     */
+    suspend fun conversation(
+        sessionId: String,
+        cursor: Long = 0,
+        waitSeconds: Int = 55,
+    ): Pair<Long, List<Envelope>> = withContext(Dispatchers.IO) {
+        val path = "/v1/sessions/$sessionId/conversation?cursor=$cursor&wait=$waitSeconds"
+        val resp = authed("GET", path, null, readTimeoutMs = (waitSeconds + 10) * 1000)
+        when (resp.code) {
+            200 -> {
+                val json = JSONObject(resp.body.ifEmpty { "{}" })
+                val newCursor = json.optLong("cursor", cursor)
+                val arr = json.optJSONArray("events") ?: JSONArray()
+                val events = (0 until arr.length()).map { i ->
+                    val o = arr.getJSONObject(i)
+                    Envelope(
+                        id = o.getString("id"),
+                        seq = o.optLong("seq", 0),
+                        type = EventType.fromSlug(o.getString("type")),
+                        project = o.optString("project", ""),
+                        session = o.optString("session", ""),
+                        title = o.optString("title", ""),
+                        body = o.optString("body", ""),
+                        choices = o.optJSONArray("choices")?.let { ca ->
+                            (0 until ca.length()).map { ci -> ca.getString(ci) }
+                        } ?: emptyList(),
+                        expires = o.optLong("expires", 0),
+                        msgRole = o.optString("msg_role", ""),
+                        msgPartID = o.optString("msg_part_id", ""),
+                        msgText = o.optString("msg_text", ""),
+                        msgKind = o.optString("msg_kind", ""),
+                        msgTime = o.optLong("msg_time", 0),
+                    )
+                }
+                newCursor to events
+            }
+            404 -> throw UnknownSession("session gone or prh restarted")
+            else -> throw IOException("conversation failed: ${resp.code}")
+        }
+    }
+
+    /**
+     * Sends text into a session — the "reply in sessions" affordance.
+     * POST /v1/sessions/{id}/prompt.
+     *
+     * Routes to a kind:"prompt" decision the plugin applies via Kilo's
+     * prompt_async. prh never holds credentials, so it cannot send the text
+     * itself.
+     */
+    suspend fun sessionPrompt(sessionId: String, text: String): Unit = withContext(Dispatchers.IO) {
+        val body = JSONObject().apply {
+            put("text", text)
+        }.toString().toByteArray()
+
+        val resp = authed("POST", "/v1/sessions/$sessionId/prompt", body)
+        if (resp.code == 404) throw UnknownSession("session gone or prh restarted")
         if (resp.code !in 200..299) throw HttpException(resp.code, "prompt failed: ${resp.body}")
     }
 

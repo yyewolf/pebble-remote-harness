@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      No action bar.
+
+      Every screen draws its own title, and with no theme declared the app was
+      getting the platform default — which has an action bar. On targetSdk 35+
+      edge-to-edge is enforced, so the activity's content is laid out from y=0
+      while the action bar is drawn over the top of it: the first ~239px of
+      every screen, including the first row of the session list, sat underneath
+      an opaque bar. The list looked permanently one session short.
+    -->
+    <style name="PrhTheme" parent="@android:style/Theme.Material.Light.NoActionBar" />
+</resources>

@@ -45,6 +45,7 @@ class SettingsActivity : ComponentActivity() {
     private lateinit var statusText: TextView
     private lateinit var pairButton: Button
     private lateinit var scanButton: Button
+    private lateinit var sessionsButton: Button
     private val scope = CoroutineScope(Dispatchers.Main)
 
     /**
@@ -71,6 +72,22 @@ class SettingsActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) launchScanner() else {
                 Toast.makeText(this, "Camera permission needed to scan", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    /**
+     * Requests POST_NOTIFICATIONS. A denial is not fatal — prompts still reach
+     * the watch — but it is worth saying what was lost, because the phone then
+     * has no way to tell you a decision is waiting.
+     */
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) {
+                Toast.makeText(
+                    this,
+                    "Without notifications, prompts only reach the watch",
+                    Toast.LENGTH_LONG,
+                ).show()
             }
         }
 
@@ -137,6 +154,13 @@ class SettingsActivity : ComponentActivity() {
             text = "Not paired"
             setPadding(0, 16, 0, 0)
         }
+        sessionsButton = Button(this).apply {
+            text = getString(R.string.sessions_button)
+            visibility = android.view.View.GONE
+            setOnClickListener {
+                startActivity(Intent(this@SettingsActivity, SessionsActivity::class.java))
+            }
+        }
 
         root.addView(hostLabel)
         root.addView(hostField)
@@ -145,8 +169,10 @@ class SettingsActivity : ComponentActivity() {
         root.addView(pairButton)
         root.addView(scanButton)
         root.addView(statusText)
+        root.addView(sessionsButton)
         scroll.addView(root)
         setContentView(scroll)
+        scroll.padForSystemBars()
 
         prefill()
         pairButton.setOnClickListener { doPair() }
@@ -235,6 +261,23 @@ class SettingsActivity : ComponentActivity() {
 
         if (PrhPrefs.isPaired(this)) {
             statusText.text = "Paired"
+            sessionsButton.visibility = android.view.View.VISIBLE
+            // Also asked here, not only on the pairing path: everyone who
+            // paired before this was added is already installed and would
+            // otherwise never be asked, leaving notifications permanently dead
+            // with no indication why.
+            requestNotificationPermission()
+
+            // Start the poll service on every launch, not only on pairing.
+            //
+            // It was previously started in exactly two places: right after
+            // pairing, and on ACTION_BOOT_COMPLETED. Anything that kills the
+            // process in between — a reinstall, a force-stop, the user swiping
+            // the app away, or the system reclaiming memory — left it dead
+            // until the next reboot, with the app still showing "Paired" and
+            // quietly receiving nothing. Starting it here is idempotent: if it
+            // is already running this is just another onStartCommand.
+            PrhService.start(this)
         }
         // The pairing key is never shown in a text field: it is a high-entropy
         // one-time secret that arrived out of band, and putting it in an
@@ -302,7 +345,9 @@ class SettingsActivity : ComponentActivity() {
 
                 withContext(Dispatchers.Main) {
                     statusText.text = "Paired"
+                    sessionsButton.visibility = android.view.View.VISIBLE
                     Toast.makeText(this@SettingsActivity, "Paired", Toast.LENGTH_SHORT).show()
+                    requestNotificationPermission()
                     requestBatteryExemption()
                     PrhService.start(this@SettingsActivity)
                 }
@@ -339,5 +384,29 @@ class SettingsActivity : ComponentActivity() {
                 startActivity(intent)
             }
         }
+    }
+
+    /**
+     * Asks for POST_NOTIFICATIONS.
+     *
+     * Declaring it in the manifest is not enough on API 33+: it is a runtime
+     * permission, and until it is granted every `notify()` call is dropped on
+     * the floor without an error. The manifest declared it and nothing ever
+     * asked, so the app could not post a single notification — the prompt
+     * alert, the "watch unreachable" fallback, and the foreground service's
+     * own notification were all silently discarded.
+     *
+     * Asked here rather than at first prompt because a permission dialog that
+     * appears while an agent is blocked waiting for an approval is the worst
+     * possible moment for it.
+     */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
     }
 }

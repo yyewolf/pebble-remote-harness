@@ -23,6 +23,7 @@
     </queries>
 
     <application
+        android:theme="@style/PrhTheme"
         android:allowBackup="false"
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
@@ -54,6 +55,29 @@
                 <data android:scheme="prh" />
             </intent-filter>
         </activity>
+
+        <!--
+          The session list and per-session conversation. Not exported: they
+          are reached only from within the app (the launcher is Settings, and
+          Settings opens Sessions once paired). They carry no secrets and
+          need no intent filters.
+        -->
+        <activity
+            android:name=".SessionsActivity"
+            android:exported="false"
+            android:label="@string/sessions_title" />
+
+        <!--
+          singleTop: prompt notifications deep-link here, and a second prompt
+          for the session already on screen must reuse this instance through
+          onNewIntent rather than stacking another copy of the same
+          conversation behind it.
+        -->
+        <activity
+            android:name=".ConversationActivity"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:label="@string/conversation_title" />
 
         <service
             android:name=".PrhService"

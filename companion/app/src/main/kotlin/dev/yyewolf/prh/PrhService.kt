@@ -3,6 +3,7 @@ package dev.yyewolf.prh
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -216,13 +217,27 @@ class PrhService : Service() {
     /**
      * Delivers one envelope.
      *
-     * needsReply -> wakeWatchApp() then send()
+     * needsReply -> wakeWatchApp() then send(), *and* notify the phone
      * otherwise  -> send() only if the watchapp is already open
-     * if the watch is unreachable, post an alert notification instead. A
-     * prompt must never be silently dropped: the agent is blocked waiting
-     * for it.
+     *
+     * A prompt always produces a phone notification, whether or not the watch
+     * got it. The watch's 200px screen is why this app exists: "bash / rm
+     * ../fds" is not enough to decide on, and the notification is the only
+     * thing that says a decision is waiting and taps straight through to the
+     * conversation behind it. Posting only when the watch was unreachable —
+     * which is what this did — meant that in the normal case, watch connected,
+     * the phone stayed completely silent and the pending prompt could only be
+     * found by opening the app and going looking for it.
+     *
+     * msg envelopes never reach the watch — conversation is phone-only and
+     * stays off Bluetooth. The conversation view fetches them on demand via
+     * GET /v1/sessions/{id}/conversation, so there is nothing to do here.
      */
     private fun deliver(envelope: Envelope) {
+        if (!envelope.type.crossesBluetooth) {
+            return
+        }
+
         val connected = bridge.isConnected()
         Log.i(TAG, "deliver: connected=$connected type=${envelope.type}")
 
@@ -233,9 +248,14 @@ class PrhService : Service() {
                 Thread.sleep(500)
                 bridge.send(envelope)
             } else {
-                Log.w(TAG, "watch unreachable, posting notification")
-                postAlert(envelope)
+                Log.w(TAG, "watch unreachable, prompt is phone-only")
             }
+            postAlert(envelope)
+        } else if (envelope.type == EventType.GONE) {
+            // Answered on the watch, or at the desk. Take the notification
+            // down rather than leaving one that opens a settled prompt.
+            cancelAlert(envelope.id)
+            if (connected) bridge.send(envelope)
         } else {
             if (connected) {
                 bridge.send(envelope)
@@ -263,13 +283,52 @@ class PrhService : Service() {
 
     private fun postAlert(envelope: Envelope) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        val notif = NotificationCompat.Builder(this, CHANNEL_ALERTS)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ALERTS)
             .setContentTitle("[${envelope.project}] ${envelope.title}")
             .setContentText(envelope.body)
+            // The body is a command or a question and is routinely longer than
+            // one line. Collapsed it is elided, which is the opposite of what
+            // this notification is for.
+            .setStyle(NotificationCompat.BigTextStyle().bigText(envelope.body))
             .setSmallIcon(android.R.drawable.stat_notify_error)
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .build()
-        nm.notify(envelope.id.hashCode(), notif)
+
+        // A prompt taps through to its conversation, so the decision is made
+        // with the context above it. Without this the notification is a dead
+        // end: it says something needs answering and gives no way to get there.
+        if (envelope.type.needsReply && envelope.session.isNotEmpty()) {
+            builder.setContentIntent(conversationIntent(envelope))
+        }
+
+        nm.notify(envelope.id.hashCode(), builder.build())
+    }
+
+    /**
+     * Deep-links into the session's conversation.
+     *
+     * CLEAR_TOP/SINGLE_TOP so tapping a second prompt for a session already on
+     * screen reuses that view instead of stacking another copy of it.
+     */
+    private fun conversationIntent(envelope: Envelope): PendingIntent {
+        val intent = Intent(this, ConversationActivity::class.java).apply {
+            putExtra(ConversationActivity.EXTRA_SESSION_ID, envelope.session)
+            putExtra(ConversationActivity.EXTRA_SESSION_TITLE, envelope.project)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        return PendingIntent.getActivity(
+            this,
+            envelope.session.hashCode(),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    /** Takes down the notification for a prompt that has been settled. */
+    private fun cancelAlert(envelopeId: String) {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        nm.cancel(envelopeId.hashCode())
     }
 }
