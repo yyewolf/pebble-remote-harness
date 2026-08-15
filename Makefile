@@ -52,11 +52,23 @@ watchapp:
 companion:
 	cd companion && ./gradlew assembleDebug
 
+# Everything a fresh machine needs, in one directory. The VSIX already
+# contains prh and the Kilo plugin; the standalone binary is here for running
+# the daemon without VSCode, which is a supported setup.
+package: vsix watchapp companion
+	mkdir -p dist
+	cp bin/prh dist/prh
+	cp bin/pebble-remote-harness-*.vsix dist/
+	cp watchapp/build/watchapp.pbw dist/prh-watchapp.pbw
+	cp companion/app/build/outputs/apk/debug/app-debug.apk dist/prh-companion.apk
+	@echo
+	@ls -la dist/
+
 fmt:
 	cd api && gofmt -w .
 
 clean:
-	rm -rf bin
-	rm -rf extension/out
+	rm -rf bin dist
+	rm -rf extension/out extension/bin extension/plugin
 	rm -rf watchapp/build
 	cd companion && ./gradlew clean || true
