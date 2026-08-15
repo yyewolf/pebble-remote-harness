@@ -1,0 +1,24 @@
+{
+  "name": "@yyewolf/prh-plugin",
+  "version": "0.1.0",
+  "description": "Kilo plugin that reports permission prompts to the Pebble Remote Harness",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yyewolf/pebble-remote-harness",
+    "directory": "plugin"
+  },
+  "keywords": [
+    "kilo",
+    "opencode",
+    "pebble"
+  ]
+}

@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Doze will otherwise kill the long-poll and prompts arrive minutes
+         late, or not at all. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- In-app QR scan for pairing. The camera is only ever used to read the
+         `prh://` pairing code; no images leave the device. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Android 11+ package visibility. The Core Devices app is
+         `coredevices.coreapp`, NOT the classic `com.getpebble.android.basalt`
+         that still appears inside its dex — naming the old one leaves the
+         provider lookup returning nothing. Verified against 1.8.0.7. -->
+    <queries>
+        <package android:name="coredevices.coreapp" />
+        <provider android:authorities="com.getpebble.android.provider.basalt" />
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="false">
+        <!--
+          Cleartext is off. prh serves TLS and the companion pins its key, so
+          there is no legitimate plaintext path left: pairing is scan-the-code
+          only, and every request after that is HMAC-signed over pinned TLS.
+          This flag is the backstop that stops an accidental plaintext
+          connection from silently working.
+        -->
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Pairing deep link from the extension's QR code:
+                 prh://<host>:<port>?pw=<password> -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="prh" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".PrhService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>

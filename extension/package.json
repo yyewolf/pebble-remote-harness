@@ -1,0 +1,108 @@
+{
+  "name": "pebble-remote-harness",
+  "displayName": "Pebble Remote Harness",
+  "description": "Approve Kilo Code prompts from a Pebble Time 2",
+  "version": "0.1.0",
+  "publisher": "yyewolf",
+  "private": true,
+  "license": "MIT",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yyewolf/pebble-remote-harness"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "prh.start",
+        "title": "Pebble Harness: Start daemon"
+      },
+      {
+        "command": "prh.stop",
+        "title": "Pebble Harness: Stop daemon"
+      },
+      {
+        "command": "prh.pair",
+        "title": "Pebble Harness: Pair a phone"
+      },
+      {
+        "command": "prh.setPassword",
+        "title": "Pebble Harness: Set pairing password"
+      },
+      {
+        "command": "prh.devices",
+        "title": "Pebble Harness: Manage paired devices"
+      },
+      {
+        "command": "prh.showLog",
+        "title": "Pebble Harness: Show daemon log"
+      },
+      {
+        "command": "prh.installPlugin",
+        "title": "Pebble Harness: Install Kilo plugin"
+      },
+      {
+        "command": "prh.removePlugin",
+        "title": "Pebble Harness: Remove Kilo plugin"
+      }
+    ],
+    "configuration": {
+      "title": "Pebble Remote Harness",
+      "properties": {
+        "prh.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the prh daemon when VSCode opens."
+        },
+        "prh.port": {
+          "type": "number",
+          "default": 8477,
+          "description": "Port the prh daemon listens on."
+        },
+        "prh.bindAddress": {
+          "type": "string",
+          "default": "0.0.0.0",
+          "description": "Interface to bind. Must be reachable from your phone; narrow this on a multi-homed host."
+        },
+        "prh.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the prh binary. Empty means the bundled binary for this platform."
+        },
+        "prh.kiloUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Fallback only. Base URL of a kilo serve instance to talk to directly, for setups without the Kilo plugin. The plugin path needs no URL and no credentials."
+        },
+        "prh.pluginDismissed": {
+          "type": "boolean",
+          "default": false,
+          "description": "Suppress the missing-plugin notification until the next install attempt."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.0"
+  }
+}

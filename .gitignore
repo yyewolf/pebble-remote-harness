@@ -30,3 +30,36 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# prh daemon build output
+bin/
+# collected installables from `make package`
+dist/
+
+# VSCode extension
+node_modules/
+extension/out/
+*.vsix
+# copied in at package time by `make vsix`
+extension/bin/
+extension/plugin/
+
+# Pebble watchapp
+watchapp/build/
+*.pbw
+.lock-waf*
+
+# Android companion
+.gradle/
+companion/build/
+companion/app/build/
+companion/local.properties
+*.apk
+*.keystore
+
+
+# temporary Kilo probe plugin (not part of the project)
+.kilo/
+
+# npm pack output; the plugin is loaded from source, never from a tarball
+*.tgz
