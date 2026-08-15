@@ -41,6 +41,13 @@ class PrhClient(
      */
     class NotPaired(message: String) : IOException(message)
 
+    /**
+     * prh is reachable and the code may well be right, but enrolment is not
+     * armed. Distinct from a bad key so the UI can say "start pairing in the
+     * editor" rather than "wrong code".
+     */
+    class PairingClosed(message: String) : IOException(message)
+
     private var sessionKeyId: String? = null
     private var sessionKey: ByteArray? = null
 
@@ -57,17 +64,73 @@ class PrhClient(
     val isLoggedIn: Boolean get() = sessionKey != null
 
     /**
-     * Trades the pairing passphrase for a device secret. The only call that
-     * carries the passphrase, and the only one that is not signed.
+     * Enrols using the one-time pairing key from the QR — the preferred path.
+     *
+     * The key is proved by signing rather than sent, and the device secret
+     * comes back sealed under it, so the enrolment exchange carries nothing an
+     * eavesdropper can use. Compare [registerWithPassphrase], where both halves
+     * travel in the clear.
+     *
+     * Returns the device ID and the base64url device secret.
      */
-    suspend fun register(password: String, deviceName: String): Pair<String, String> =
+    suspend fun registerWithPairingKey(
+        pairingKey: ByteArray,
+        deviceName: String,
+    ): Pair<String, String> = withContext(Dispatchers.IO) {
+        val body = JSONObject().apply {
+            put("device_name", deviceName)
+            put("platform", "android")
+        }.toString().toByteArray()
+
+        val resp = try {
+            doJson("POST", "/v1/register", body, SigningKey(PrhSigning.PAIRING_KEY_ID, pairingKey))
+        } catch (e: HttpException) {
+            // 403 is the window, not the key: prh is up and the code is fine,
+            // but nobody armed enrolment or it has already been used.
+            if (e.code == 403) {
+                throw PairingClosed("pairing is not open on prh; start pairing from the editor")
+            }
+            throw e
+        }
+
+        val id = resp.optString("device_id", "")
+        if (id.isEmpty()) throw IOException("register: no device id in response")
+
+        val secret = PrhSigning.unwrapDeviceSecret(
+            pairingKey = pairingKey,
+            wrapSalt = resp.getString("wrap_salt"),
+            wrapNonce = resp.getString("wrap_nonce"),
+            wrapSecret = resp.getString("wrap_secret"),
+            deviceId = id,
+        )
+        id to PrhSigning.encode(secret)
+    }
+
+    /**
+     * Enrols with the pairing passphrase, for when a code cannot be scanned.
+     *
+     * Both the passphrase going up and the device secret coming back travel in
+     * the clear, so this is only as safe as the transport — which today is
+     * plaintext HTTP. Prefer [registerWithPairingKey]; this exists because
+     * typing 32 random bytes is not something anyone will do.
+     */
+    suspend fun registerWithPassphrase(password: String, deviceName: String): Pair<String, String> =
         withContext(Dispatchers.IO) {
             val body = JSONObject().apply {
                 put("password", password)
                 put("device_name", deviceName)
                 put("platform", "android")
+            }.toString().toByteArray()
+
+            val resp = try {
+                doJson("POST", "/v1/register", body, null)
+            } catch (e: HttpException) {
+                if (e.code == 403) {
+                    throw PairingClosed("pairing is not open on prh; start pairing from the editor")
+                }
+                throw e
             }
-            val resp = doJson("POST", "/v1/register", body.toString().toByteArray(), null)
+
             val id = resp.optString("device_id", "")
             val secret = resp.optString("device_secret", "")
             if (id.isEmpty() || secret.isEmpty()) {

@@ -28,7 +28,10 @@ import kotlinx.coroutines.withContext
  *
  * Registration lives here rather than on the watch: typing an IP address with
  * watch buttons is not a design. The VSCode extension shows a QR encoding
- * `prh://<host>:<port>?pw=<password>`, which arrives as a VIEW intent.
+ * `prh://<host>:<port>?k=<one-time pairing key>`, which arrives as a VIEW
+ * intent. The older `?pw=<passphrase>` form still works and is the fallback
+ * for when a code cannot be scanned, but it sends both the passphrase and the
+ * device secret in the clear — see docs/protocol.md.
  */
 class SettingsActivity : Activity() {
 
@@ -42,6 +45,12 @@ class SettingsActivity : Activity() {
     private var deepLinkHost: String? = null
     private var deepLinkPort: Int = -1
     private var deepLinkPw: String? = null
+
+    /**
+     * The one-time pairing key from the QR, held only for this pairing attempt
+     * and never persisted. It is spent as soon as a device enrols.
+     */
+    private var deepLinkKey: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -83,7 +92,7 @@ class SettingsActivity : Activity() {
             setPadding(24, 16, 24, 16)
         }
         val pwLabel = TextView(this).apply {
-            text = "Password"
+            text = "Password (only if you cannot scan a code)"
             textSize = 16f
             setPadding(0, 16, 0, 8)
         }
@@ -127,6 +136,9 @@ class SettingsActivity : Activity() {
         if (data.scheme != "prh") return
         deepLinkHost = data.host
         deepLinkPort = data.port
+        // `k` is the one-time pairing key from the QR; `pw` is the passphrase
+        // fallback for when a code cannot be scanned. Prefer `k`.
+        deepLinkKey = data.getQueryParameter("k")
         deepLinkPw = data.getQueryParameter("pw")
     }
 
@@ -145,7 +157,18 @@ class SettingsActivity : Activity() {
         if (PrhPrefs.isPaired(this)) {
             statusText.text = "Paired"
         }
-        deepLinkPw?.let { passwordField.setText(it) }
+        // The pairing key is never shown in the password box: it is a
+        // high-entropy one-time secret that arrived out of band, and putting
+        // it in an editable text field invites it into clipboards and
+        // screenshots. It is held in memory for this one pairing attempt.
+        if (deepLinkKey != null) {
+            passwordField.isEnabled = false
+            passwordField.setText("")
+            passwordField.hint = "Not needed — pairing code scanned"
+            statusText.text = "Ready to pair with the scanned code"
+        } else {
+            deepLinkPw?.let { passwordField.setText(it) }
+        }
     }
 
     // -- pairing -----------------------------------------------------------
@@ -154,9 +177,14 @@ class SettingsActivity : Activity() {
         val host = hostField.text.toString().trim()
         val port = portField.text.toString().trim()
         val pw = passwordField.text.toString()
+        val key = deepLinkKey
 
-        if (host.isEmpty() || pw.isEmpty()) {
-            Toast.makeText(this, "Host and password required", Toast.LENGTH_SHORT).show()
+        if (host.isEmpty()) {
+            Toast.makeText(this, "Host required", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (key == null && pw.isEmpty()) {
+            Toast.makeText(this, "Scan a pairing code, or enter the passphrase", Toast.LENGTH_SHORT).show()
             return
         }
 
@@ -169,19 +197,39 @@ class SettingsActivity : Activity() {
                 val client = PrhClient(baseUrl)
                 val deviceName = PrhPrefs.getDeviceName(this@SettingsActivity)
 
-                // The one moment the passphrase is used. What comes back is
-                // the device secret, which is what everything afterwards signs
-                // with — so this screen is not needed again unless the pairing
-                // is revoked or prh loses its devices file.
-                val (deviceId, deviceSecret) = client.register(pw, deviceName)
+                // Enrolment is the one exchange whose compromise hands over
+                // everything, so take the sealed path whenever a code was
+                // scanned: the key is proved by signing rather than sent, and
+                // the device secret comes back encrypted under it.
+                //
+                // What comes back either way is the device secret, which is
+                // what everything afterwards signs with — so this screen is not
+                // needed again unless the device is revoked or prh loses its
+                // devices file.
+                val (deviceId, deviceSecret) = if (key != null) {
+                    client.registerWithPairingKey(PrhSigning.decode(key), deviceName)
+                } else {
+                    client.registerWithPassphrase(pw, deviceName)
+                }
+
                 PrhPrefs.setBaseUrl(this@SettingsActivity, baseUrl)
                 PrhPrefs.setCredentials(this@SettingsActivity, deviceId, deviceSecret)
+
+                // One window enrols one device, so the scanned code is spent.
+                // Dropping it stops a stale key sitting in memory and stops a
+                // second tap on Pair from failing confusingly.
+                deepLinkKey = null
 
                 withContext(Dispatchers.Main) {
                     statusText.text = "Paired"
                     Toast.makeText(this@SettingsActivity, "Paired", Toast.LENGTH_SHORT).show()
                     requestBatteryExemption()
                     PrhService.start(this@SettingsActivity)
+                }
+            } catch (e: PrhClient.PairingClosed) {
+                withContext(Dispatchers.Main) {
+                    statusText.text = "Pairing is not open. Run \"Pebble Harness: Pair\" in the editor, then scan again."
+                    pairButton.isEnabled = true
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {

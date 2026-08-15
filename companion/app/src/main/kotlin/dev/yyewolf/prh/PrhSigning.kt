@@ -31,6 +31,10 @@ object PrhSigning {
     const val HEADER_SERVER_TIME = "X-Prh-Time"
 
     private const val HKDF_INFO = "prh-session-wrap-v1"
+    private const val PAIRING_INFO = "prh-pairing-wrap-v1"
+
+    /** Literal key ID used when signing an enrolment with the pairing key. */
+    const val PAIRING_KEY_ID = "pair"
     private const val NONCE_BYTES = 16
     private const val GCM_TAG_BITS = 128
 
@@ -86,16 +90,52 @@ object PrhSigning {
         wrapNonce: String,
         wrappedKey: String,
         keyId: String,
+    ): ByteArray = unwrap(deviceSecret, wrapSalt, wrapNonce, wrappedKey, keyId, HKDF_INFO)
+
+    /**
+     * Recovers the device secret from a sealed enrolment response.
+     *
+     * This is what keeps the one dangerous exchange safe. The pairing key came
+     * off the screen via the camera, a channel nothing on the network can
+     * touch, so an attacker who captured the whole enrolment holds a signature
+     * and a sealed blob and can do nothing with either.
+     *
+     * The device ID is the additional data: a response whose ID was swapped in
+     * flight fails to open rather than binding a good secret to an identity
+     * prh never issued.
+     */
+    fun unwrapDeviceSecret(
+        pairingKey: ByteArray,
+        wrapSalt: String,
+        wrapNonce: String,
+        wrapSecret: String,
+        deviceId: String,
+    ): ByteArray = unwrap(pairingKey, wrapSalt, wrapNonce, wrapSecret, deviceId, PAIRING_INFO)
+
+    /**
+     * Shared AES-256-GCM open under an HKDF-derived key.
+     *
+     * [info] is what keeps the session wrap and the pairing wrap apart. Passing
+     * the wrong one yields a key that simply never opens anything, so a mix-up
+     * fails loudly rather than crossing the two purposes.
+     */
+    private fun unwrap(
+        secret: ByteArray,
+        wrapSalt: String,
+        wrapNonce: String,
+        sealed: String,
+        aad: String,
+        info: String,
     ): ByteArray {
-        val wrapKey = hkdf(deviceSecret, decode(wrapSalt), HKDF_INFO.toByteArray(Charsets.UTF_8), 32)
+        val wrapKey = hkdf(secret, decode(wrapSalt), info.toByteArray(Charsets.UTF_8), 32)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(
             Cipher.DECRYPT_MODE,
             SecretKeySpec(wrapKey, "AES"),
             GCMParameterSpec(GCM_TAG_BITS, decode(wrapNonce)),
         )
-        cipher.updateAAD(keyId.toByteArray(Charsets.UTF_8))
-        return cipher.doFinal(decode(wrappedKey))
+        cipher.updateAAD(aad.toByteArray(Charsets.UTF_8))
+        return cipher.doFinal(decode(sealed))
     }
 
     /**
