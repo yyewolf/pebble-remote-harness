@@ -2,7 +2,7 @@ package dev.yyewolf.prh
 
 import android.content.Intent
 import android.os.Bundle
-import android.text.InputType
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -13,7 +13,6 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.core.view.setPadding
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.MainScope
@@ -55,25 +54,28 @@ class ConversationActivity : ComponentActivity() {
     private lateinit var scroll: ScrollView
     private lateinit var header: TextView
     private lateinit var promptPanel: LinearLayout
-    private lateinit var promptText: TextView
     private lateinit var messagesList: LinearLayout
     private lateinit var replyField: EditText
     private lateinit var sendButton: Button
     private var conversationCursor: Long = 0
 
     /**
-     * Envelope ID -> the view rendering it, so an update replaces its text in
+     * Envelope ID -> the views rendering it, so an update replaces its text in
      * place rather than appending a duplicate. prh keys conversation entries by
      * ID (the part ID for a message), and re-sends an entry whenever it grows,
      * so without this the view would fill with partials of the same sentence.
      */
-    private val entryViews = mutableMapOf<String, View>()
+    private val entryViews = mutableMapOf<String, MessageRow>()
+
+    /** One rendered message: the row in the list, and the two views to update. */
+    private class MessageRow(val root: View, val role: TextView, val body: TextView)
 
     /** The prompt currently rendered in the panel, if any. */
     private var shownPromptId: String = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        matchSystemBarsToTheme()
 
         sessionId = intent.getStringExtra(EXTRA_SESSION_ID) ?: ""
         if (sessionId.isEmpty()) {
@@ -128,76 +130,113 @@ class ConversationActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    // -- layout ---------------------------------------------------------------
+
+    /**
+     * Header, scrolling transcript, pinned composer.
+     *
+     * The composer sits outside the ScrollView rather than at the end of it.
+     * Inside, it scrolled away with the history: on a long conversation you
+     * had to scroll to the bottom to find the reply box, and every streamed
+     * message moved it. Pinned, it is where a chat composer is expected to be,
+     * and the transcript gets the rest.
+     */
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(20)
-            layoutParams = matchWidth()
         }
 
-        header = TextView(this).apply {
-            text = sessionTitle.ifBlank { sessionId }
-            textSize = 18f
-            setPadding(0, 0, 0, 12)
-            layoutParams = matchWidth()
-        }
-
-        promptPanel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(20)
-            visibility = View.GONE
-            layoutParams = matchWidth()
-        }
-        promptText = TextView(this).apply {
-            textSize = 14f
-            setPadding(0, 0, 0, 12)
-        }
+        root.addView(buildHeader(), matchWrap())
 
         messagesList = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            layoutParams = matchWidth()
+            layoutParams = matchWrap()
         }
-
-        val replyLabel = TextView(this).apply {
-            text = "Reply"
-            textSize = 14f
-            setPadding(0, 16, 0, 6)
+        promptPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            layoutParams = matchWrap()
         }
-        replyField = EditText(this).apply {
-            hint = "Type a message to this session…"
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            maxLines = 3
-            setPadding(20, 12, 20, 12)
-            layoutParams = matchWidth()
-        }
-        sendButton = Button(this).apply {
-            text = "Send"
-            layoutParams = matchWidth()
-        }
-        sendButton.setOnClickListener { sendPrompt() }
 
         // The prompt goes *below* the conversation, not above it. You read what
         // the agent has been doing and then decide, so the decision belongs at
         // the end of that reading — and the view auto-scrolls to the bottom,
         // which put the buttons off-screen when they sat above the history.
-        root.addView(header)
-        root.addView(messagesList)
-        root.addView(promptPanel)
-        root.addView(replyLabel)
-        root.addView(replyField)
-        root.addView(sendButton)
-
-        scroll = ScrollView(this).apply {
-            addView(root)
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(4), dp(16), dp(16))
+            addView(messagesList)
+            addView(promptPanel)
         }
-        setContentView(scroll)
-        scroll.padForSystemBars()
+        scroll = ScrollView(this).apply {
+            clipToPadding = false
+            layoutParams = matchRest()
+            addView(content, matchWrap())
+        }
+        root.addView(scroll)
+        root.addView(buildComposer(), matchWrap())
+
+        setContentView(root)
+        // The IME counts here: the composer is pinned to the bottom, so without
+        // the keyboard inset it would sit underneath the keyboard it opened.
+        root.padForSystemBars(includeIme = true)
     }
 
-    private fun matchWidth() = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT,
-    )
+    private fun buildHeader(): LinearLayout {
+        val back = TextView(this).apply {
+            text = "‹"
+            textSize = 30f
+            setTextColor(textSecondary)
+            gravity = Gravity.CENTER
+            setPadding(dp(4), 0, dp(14), dp(4))
+            background = withRipple(roundedRect(surfaceColor, radiusDp = 24))
+            setOnClickListener { finish() }
+        }
+        header = bodyView(sessionTitle.ifBlank { sessionId }).apply {
+            textSize = 18f
+            setSingleLine(true)
+            ellipsize = TextUtils.TruncateAt.MIDDLE
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(8), dp(16), dp(8))
+            addView(back)
+            addView(header)
+        }
+    }
+
+    private fun buildComposer(): LinearLayout {
+        replyField = styledField(getString(R.string.reply_hint), multiline = true).apply {
+            maxLines = 4
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        sendButton = primaryButton(getString(R.string.send)).apply {
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { leftMargin = dp(8) }
+        }
+        sendButton.setOnClickListener { sendPrompt() }
+
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            addView(replyField)
+            addView(sendButton)
+        }
+        // A hairline above the whole bar, so the composer reads as a separate
+        // surface from the transcript scrolling under it.
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(surfaceColor)
+            addView(divider())
+            addView(row, matchWrap())
+        }
+    }
 
     private fun buildClient(): PrhClient? {
         val baseUrl = PrhPrefs.getBaseUrl(this) ?: return null
@@ -271,50 +310,72 @@ class ConversationActivity : ComponentActivity() {
 
     private fun isScrolledToBottom(): Boolean {
         val content = scroll.getChildAt(0) ?: return true
-        return scroll.scrollY + scroll.height >= content.height - 48
+        return scroll.scrollY + scroll.height >= content.height - dp(48)
     }
 
     private fun renderMessage(env: Envelope) {
         // prh sends an empty part when the agent retracts one.
         if (env.msgText.isBlank() && env.body.isBlank()) {
-            entryViews.remove(env.id)?.let { messagesList.removeView(it) }
+            entryViews.remove(env.id)?.let { messagesList.removeView(it.root) }
             return
         }
         val existing = entryViews[env.id]
         if (existing != null) {
-            (existing as LinearLayout).let {
-                (it.getChildAt(0) as TextView).text = roleLabel(env)
-                (it.getChildAt(1) as TextView).text = bodyOf(env)
-            }
+            existing.role.text = roleLabel(env)
+            existing.body.text = bodyOf(env)
             return
         }
-        val view = makeMessageView(env)
-        entryViews[env.id] = view
-        messagesList.addView(view)
+        val row = makeMessageView(env)
+        entryViews[env.id] = row
+        messagesList.addView(row.root, matchWrap())
     }
 
     private fun bodyOf(env: Envelope): String = env.msgText.ifBlank { env.body }
 
-    private fun makeMessageView(env: Envelope): View {
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(16, 12, 16, 12)
-            layoutParams = matchWidth()
-        }
-        val role = TextView(this).apply {
-            text = roleLabel(env)
-            textSize = 12f
+    /**
+     * One message as a bubble.
+     *
+     * Three shapes, because three kinds of thing are being shown and a flat
+     * list of paragraphs made them indistinguishable: what you said (accent,
+     * right), what the agent said (surface, left), and what it was doing —
+     * thinking and tool calls — which is context rather than conversation and
+     * is rendered quieter and monospaced so it can be skimmed past.
+     */
+    private fun makeMessageView(env: Envelope): MessageRow {
+        val mine = env.msgRole == "user" && env.msgKind.isBlank()
+        val chatter = env.msgKind == "reasoning" || env.msgKind == "tool" ||
+            env.msgKind == "step-start"
+
+        val role = captionView(roleLabel(env)).apply {
+            textSize = 11f
             setTextColor(roleColor(env))
-            layoutParams = matchWidth()
+            letterSpacing = 0.06f
         }
-        val body = TextView(this).apply {
-            text = bodyOf(env)
-            textSize = 14f
-            layoutParams = matchWidth()
+        val body = if (chatter) monoView(bodyOf(env)) else bodyView(bodyOf(env))
+        if (chatter) body.setTextColor(textSecondary)
+        if (mine) body.setTextColor(textPrimary)
+
+        val bubble = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(9), dp(12), dp(10))
+            background = when {
+                mine -> roundedRect(accentSoft, strokeColor = accentSoft)
+                chatter -> roundedRect(surfaceAltColor, radiusDp = 10)
+                else -> roundedRect(surfaceColor, strokeColor = borderColor)
+            }
+            addView(role, matchWrap())
+            addView(body, matchWrap())
         }
-        container.addView(role)
-        container.addView(body)
-        return container
+
+        // Bubbles stop short of the far edge so the alignment reads as
+        // alignment rather than as full-width blocks.
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = if (mine) Gravity.END else Gravity.START
+            setPadding(if (mine) dp(36) else 0, dp(4), if (mine) 0 else dp(36), dp(4))
+            addView(bubble, matchWrap())
+        }
+        return MessageRow(row, role, body)
     }
 
     private fun roleLabel(env: Envelope): String = when (env.msgKind) {
@@ -326,31 +387,60 @@ class ConversationActivity : ComponentActivity() {
         else -> env.msgRole.ifBlank { "assistant" }
     }
 
-    private fun roleColor(env: Envelope): Int = when (env.msgKind) {
-        "reasoning" -> 0xFF888888.toInt()
-        "tool" -> 0xFF0088CC.toInt()
-        else -> if (env.msgRole == "user") 0xFF0066CC.toInt() else 0xFF222222.toInt()
+    private fun roleColor(env: Envelope): Int = when {
+        env.msgKind == "reasoning" -> textFaint
+        env.msgKind == "tool" -> accentColor
+        env.msgRole == "user" -> accentColor
+        else -> textSecondary
     }
 
     // -- the pending prompt ------------------------------------------------
 
+    /**
+     * The decision, as a card at the end of the transcript.
+     *
+     * Deliberately the loudest thing on the screen — accent border, the body
+     * in monospace because it is usually a literal command, and the three
+     * answers coloured by what they do. This is the reason the screen exists.
+     */
     private fun showPrompt(env: Envelope) {
         shownPromptId = env.id
-        promptText.text = buildString {
-            if (env.title.isNotBlank()) append(env.title).append('\n')
-            append(env.body)
+
+        val card = card().apply {
+            background = roundedRect(surfaceColor, strokeColor = accentColor, strokeDp = 2)
+            layoutParams = matchWrap()
+        }
+        if (env.title.isNotBlank()) {
+            card.addView(
+                bodyView(env.title).apply {
+                    textSize = 16f
+                    setTextColor(accentColor)
+                },
+                matchWrap(),
+            )
+        }
+        card.addSpaced(
+            monoView(env.body).apply {
+                background = roundedRect(surfaceAltColor, radiusDp = 8)
+                setPadding(dp(10), dp(8), dp(10), dp(8))
+            },
+            if (env.title.isNotBlank()) 10 else 0,
+        )
+
+        env.choices.forEachIndexed { index, choice ->
+            val button = when {
+                env.type == EventType.QUES -> secondaryButton(choice)
+                choice.startsWith("Always") -> secondaryButton(choice)
+                choice.equals("Reject", ignoreCase = true) -> negativeButton(choice)
+                else -> positiveButton(choice)
+            }
+            button.setOnClickListener { answerPrompt(env, choice, index) }
+            card.addSpaced(button, if (index == 0) 14 else 8)
         }
 
         promptPanel.removeAllViews()
-        promptPanel.addView(promptText)
-        env.choices.forEachIndexed { index, choice ->
-            val btn = Button(this).apply {
-                text = choice
-                layoutParams = matchWidth()
-                setOnClickListener { answerPrompt(env, choice, index) }
-            }
-            promptPanel.addView(btn)
-        }
+        promptPanel.addView(card)
+        promptPanel.setPadding(0, dp(8), 0, 0)
         promptPanel.visibility = View.VISIBLE
     }
 
@@ -408,9 +498,11 @@ class ConversationActivity : ComponentActivity() {
         }
     }
 
+    /** The buttons live inside the prompt card, which is the panel's only child. */
     private fun setPromptEnabled(enabled: Boolean) {
-        for (i in 0 until promptPanel.childCount) {
-            (promptPanel.getChildAt(i) as? Button)?.isEnabled = enabled
+        val card = promptPanel.getChildAt(0) as? LinearLayout ?: return
+        for (i in 0 until card.childCount) {
+            (card.getChildAt(i) as? Button)?.isEnabled = enabled
         }
     }
 

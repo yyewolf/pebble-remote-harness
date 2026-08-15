@@ -9,9 +9,25 @@
     <string name="sessions_button">Sessions</string>
     <string name="sessions_title">Sessions</string>
     <string name="conversation_title">Conversation</string>
+    <string name="app_tagline">Answer your agents from your wrist</string>
+
     <string name="delivery_heading">Delivery</string>
-    <string name="watch_notifications">Send prompts to the watch</string>
-    <string name="phone_notifications">Show notifications on this phone</string>
+    <string name="watch_notifications">Send to the watch</string>
+    <string name="watch_notifications_hint">Wake the watchapp and push the prompt over Bluetooth</string>
+    <string name="phone_notifications">Notify this phone</string>
+    <string name="phone_notifications_hint">Post a notification that opens straight to the conversation</string>
+
     <string name="connection_heading">Connection</string>
     <string name="heartbeat_never">No contact with prh yet</string>
+    <string name="pairing_heading">Pairing</string>
+    <string name="host_label">Host</string>
+    <string name="port_label">Port</string>
+    <string name="paired">Paired</string>
+    <string name="not_paired">Not paired</string>
+
+    <string name="sessions_empty_title">Nothing running</string>
+    <string name="sessions_empty_body">Sessions appear here as soon as an agent starts working in VSCode.</string>
+    <string name="reply_hint">Reply to this session…</string>
+    <string name="send">Send</string>
+    <string name="back">Back</string>
 </resources>

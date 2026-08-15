@@ -1,14 +1,30 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!--
-      No action bar.
+<!--
+  Declaring a theme at all is what fixed the session list: with none, the app
+  inherited the platform's default, which still carries an ActionBar — and
+  since targetSdk 35 every app is laid out edge-to-edge with no way to opt
+  out, so the bar drew over content that started at y=0 and permanently hid
+  the first row. NoActionBar plus the insets handling in Insets.kt is the fix;
+  do not reintroduce a decor bar without also removing that padding.
 
-      Every screen draws its own title, and with no theme declared the app was
-      getting the platform default — which has an action bar. On targetSdk 35+
-      edge-to-edge is enforced, so the activity's content is laid out from y=0
-      while the action bar is drawn over the top of it: the first ~239px of
-      every screen, including the first row of the session list, sat underneath
-      an opaque bar. The list looked permanently one session short.
-    -->
-    <style name="PrhTheme" parent="@android:style/Theme.Material.Light.NoActionBar" />
+  Parented on the platform's Material rather than AppCompat's on purpose: the
+  activities are plain ComponentActivity, so there is no AppCompatDelegate to
+  service an AppCompat theme. `values-night` swaps the parent for the dark
+  variant, which is what gives stock EditText and Switch a correct dark look
+  without any code branching on the mode.
+-->
+<resources>
+    <style name="PrhTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorControlActivated">@color/accent</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="android:textColorHint">@color/text_faint</item>
+
+        <!-- The bars are drawn behind, so anything but transparent shows as a
+             band of the wrong colour over the content. -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
 </resources>

@@ -1,7 +1,10 @@
 package dev.yyewolf.prh
 
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
+import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -12,7 +15,6 @@ import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.core.view.setPadding
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.MainScope
@@ -26,9 +28,10 @@ import kotlinx.coroutines.launch
  *
  * One prh serves every VSCode window, and every window's sessions land here.
  * A session with [SessionSummary.hasPrompt] true has a permission or question
- * prompt pending: tapping it opens the conversation so you can read what the
- * agent is asking for before approving — which is the whole point of a phone
- * view when the watch's 200px screen cannot show enough context.
+ * prompt pending: it wears an accent border and a badge, and tapping it opens
+ * the conversation so you can read what the agent is asking for before
+ * approving — which is the whole point of a phone view when the watch's 200px
+ * screen cannot show enough context.
  *
  * The list refreshes on a timer while it is on screen and stops the moment it
  * is not, so a backgrounded app is not quietly polling. prh returns the list
@@ -39,7 +42,8 @@ class SessionsActivity : ComponentActivity() {
     private val scope = MainScope()
     private var refreshJob: Job? = null
     private lateinit var adapter: SessionAdapter
-    private lateinit var emptyText: TextView
+    private lateinit var subtitle: TextView
+    private lateinit var empty: LinearLayout
     private lateinit var list: ListView
     private var client: PrhClient? = null
 
@@ -48,6 +52,7 @@ class SessionsActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        matchSystemBarsToTheme()
 
         client = buildClient()
         if (client == null) {
@@ -61,35 +66,49 @@ class SessionsActivity : ComponentActivity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(24)
+            setPadding(dp(20), dp(12), dp(20), 0)
         }
 
-        val title = TextView(this).apply {
-            text = "Sessions"
-            textSize = 20f
-            setPadding(0, 0, 0, 16)
-        }
+        subtitle = captionView("")
 
-        emptyText = TextView(this).apply {
-            text = "No sessions yet. Start coding in VSCode."
-            setPadding(0, 48, 0, 0)
+        empty = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             visibility = View.GONE
+            layoutParams = matchRest()
+            addView(
+                bodyView(getString(R.string.sessions_empty_title)).apply {
+                    textSize = 17f
+                    gravity = Gravity.CENTER
+                    setTextColor(textSecondary)
+                },
+            )
+            addView(
+                captionView(getString(R.string.sessions_empty_body)).apply {
+                    gravity = Gravity.CENTER
+                    setTextColor(textFaint)
+                    setPadding(dp(24), dp(8), dp(24), 0)
+                },
+            )
         }
 
         list = ListView(this).apply {
             adapter = this@SessionsActivity.adapter
+            // The rows carry their own card backgrounds and their own spacing,
+            // so the platform's divider line and full-bleed highlight both work
+            // against them.
+            divider = null
+            dividerHeight = 0
+            selector = ColorDrawable(Color.TRANSPARENT)
+            clipToPadding = false
+            setPadding(0, dp(8), 0, dp(24))
             // Height 0 with weight 1, *not* WRAP_CONTENT. A ListView measures
             // only a couple of children when asked to wrap inside a vertical
             // LinearLayout, so its height is derived from a sample of the rows
             // and changes as the data does — which is what made sessions look
             // like they were appearing and disappearing at random on every
             // refresh. Giving it the leftover space measures it once, properly.
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f,
-            )
+            layoutParams = matchRest()
         }
         list.setOnItemClickListener { _, _, position, _ ->
             val session = adapter.getItem(position)
@@ -101,8 +120,9 @@ class SessionsActivity : ComponentActivity() {
             )
         }
 
-        root.addView(title)
-        root.addView(emptyText)
+        root.addView(titleView(getString(R.string.sessions_title)), matchWrap())
+        root.addSpaced(subtitle, 4)
+        root.addView(empty)
         root.addView(list)
         setContentView(root)
         root.padForSystemBars()
@@ -158,7 +178,7 @@ class SessionsActivity : ComponentActivity() {
                         "refresh: received=${sessions.size} rendered=${adapter.count} " +
                             "ids=${sessions.map { it.id.takeLast(6) }}",
                     )
-                    emptyText.visibility = if (sessions.isEmpty()) View.VISIBLE else View.GONE
+                    renderSummary(sessions)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -170,11 +190,25 @@ class SessionsActivity : ComponentActivity() {
                             Toast.LENGTH_SHORT,
                         ).show()
                     }
-                    if (!loaded) emptyText.visibility = View.GONE
+                    if (!loaded) empty.visibility = View.GONE
                 }
                 delay(REFRESH_INTERVAL_MS)
             }
         }
+    }
+
+    /** The count line under the title, and the empty state it replaces. */
+    private fun renderSummary(sessions: List<SessionSummary>) {
+        empty.visibility = if (sessions.isEmpty()) View.VISIBLE else View.GONE
+        list.visibility = if (sessions.isEmpty()) View.GONE else View.VISIBLE
+
+        val waiting = sessions.count { it.hasPrompt }
+        subtitle.text = when {
+            sessions.isEmpty() -> ""
+            waiting > 0 -> "${sessions.size} open · $waiting waiting on you"
+            else -> "${sessions.size} open"
+        }
+        subtitle.setTextColor(if (waiting > 0) accentColor else textSecondary)
     }
 
     // -- adapter ----------------------------------------------------------
@@ -222,54 +256,74 @@ class SessionsActivity : ComponentActivity() {
             // Recycle. Building a fresh view hierarchy on every bind — which is
             // what ignoring convertView does — makes the list rebuild itself
             // continuously while it refreshes.
-            val row = convertView as? LinearLayout ?: newRow()
+            val outer = convertView as? LinearLayout ?: newRow()
             val s = getItem(position)
 
-            val titleRow = row.getChildAt(0) as LinearLayout
-            (titleRow.getChildAt(0) as TextView).text = s.displayTitle()
-            (titleRow.getChildAt(1) as TextView).apply {
-                text = when {
-                    !s.hasPrompt -> ""
-                    s.promptType == EventType.QUES.slug -> "  ● asking"
-                    else -> "  ● waiting"
-                }
-                visibility = if (s.hasPrompt) View.VISIBLE else View.GONE
+            val card = outer.getChildAt(0) as LinearLayout
+            val text = card.getChildAt(0) as LinearLayout
+            (text.getChildAt(0) as TextView).text = s.displayTitle()
+            (text.getChildAt(1) as TextView).text = s.statusLine()
+
+            val badge = card.getChildAt(1) as TextView
+            if (s.hasPrompt) {
+                badge.visibility = View.VISIBLE
+                badge.text = if (s.promptType == EventType.QUES.slug) "ASKING" else "WAITING"
+                badge.setTextColor(accentColor)
+                badge.background = roundedRect(accentSoft, radiusDp = 20)
+            } else {
+                badge.visibility = View.GONE
             }
-            (row.getChildAt(1) as TextView).text = s.statusLine()
-            return row
+
+            // A pending prompt is the one thing this screen exists to surface,
+            // so it changes the whole card rather than only adding a badge.
+            card.background = withRipple(
+                roundedRect(
+                    surfaceColor,
+                    strokeColor = if (s.hasPrompt) accentColor else borderColor,
+                ),
+            )
+            return outer
         }
 
         /** One row's view hierarchy, bound later by [getView]. */
         private fun newRow(): LinearLayout {
-            val container = LinearLayout(this@SessionsActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(20)
+            val title = bodyView().apply {
+                textSize = 16f
+                setSingleLine(true)
+                ellipsize = TextUtils.TruncateAt.MIDDLE
             }
-            val titleRow = LinearLayout(this@SessionsActivity).apply {
+            val status = captionView().apply {
+                setSingleLine(true)
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(0, dp(3), 0, 0)
+            }
+            val text = LinearLayout(this@SessionsActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addView(title)
+                addView(status)
+            }
+            val badge = pill("", accentColor, accentSoft).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { leftMargin = dp(10) }
+            }
+            val card = LinearLayout(this@SessionsActivity).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(14), dp(14), dp(14), dp(14))
+                layoutParams = matchWrap()
+                addView(text)
+                addView(badge)
             }
-            titleRow.addView(
-                TextView(this@SessionsActivity).apply {
-                    textSize = 16f
-                    setSingleLine(true)
-                },
-            )
-            titleRow.addView(
-                TextView(this@SessionsActivity).apply {
-                    setTextColor(0xFFFF8800.toInt())
-                    textSize = 14f
-                },
-            )
-            container.addView(titleRow)
-            container.addView(
-                TextView(this@SessionsActivity).apply {
-                    textSize = 12f
-                    setTextColor(0xFF888888.toInt())
-                    setPadding(0, 6, 0, 0)
-                },
-            )
-            return container
+            // The gap between rows is the outer container's padding: a ListView
+            // hands its children AbsListView.LayoutParams, which has no margins.
+            return LinearLayout(this@SessionsActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, dp(4), 0, dp(4))
+                addView(card)
+            }
         }
     }
 

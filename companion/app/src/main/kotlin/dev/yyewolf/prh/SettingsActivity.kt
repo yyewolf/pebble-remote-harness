@@ -9,11 +9,9 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -55,8 +53,8 @@ class SettingsActivity : ComponentActivity() {
     private lateinit var scanButton: Button
     private lateinit var sessionsButton: Button
     private lateinit var heartbeatText: TextView
-    private lateinit var watchCheck: CheckBox
-    private lateinit var notifCheck: CheckBox
+    private lateinit var statusPill: TextView
+    private lateinit var deliverySection: LinearLayout
     private val scope = CoroutineScope(Dispatchers.Main)
 
     /** Ticks the heartbeat line while this screen is on top. */
@@ -128,107 +126,128 @@ class SettingsActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        matchSystemBarsToTheme()
 
         parseDeepLink(intent)
 
-        val scroll = ScrollView(this).apply {
-            fitsSystemWindows = true
-            clipToPadding = false
-        }
-
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(48, 24, 48, 48)
-            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(20), dp(12), dp(20), dp(40))
         }
 
-        val hostLabel = TextView(this).apply {
-            text = "Host"
-            textSize = 16f
-            setPadding(0, 0, 0, 8)
+        root.addView(titleView(getString(R.string.app_name)), matchWrap())
+        root.addSpaced(captionView(getString(R.string.app_tagline)), 4)
+
+        // Connection first, pairing last. Pairing is a one-time act and the
+        // thing you actually come back for is "is it working, and what is
+        // waiting" — so the screen leads with that. When nothing is paired the
+        // delivery section hides itself, which floats pairing back up to
+        // directly under the status it explains.
+        root.addSpaced(sectionLabel(getString(R.string.connection_heading)), 28)
+        root.addSpaced(buildStatusCard(), 8)
+
+        deliverySection = buildDeliverySection()
+        root.addSpaced(deliverySection, 0)
+        root.addSpaced(sectionLabel(getString(R.string.pairing_heading)), 28)
+        root.addSpaced(buildPairingCard(), 8)
+
+        val scroll = ScrollView(this).apply {
+            clipToPadding = false
+            addView(root, matchWrap())
         }
-        hostField = EditText(this).apply {
-            hint = "e.g. 192.168.1.10"
-            inputType = InputType.TYPE_CLASS_TEXT
-            maxLines = 1
-            setPadding(24, 16, 24, 16)
+        setContentView(scroll)
+        scroll.padForSystemBars()
+
+        prefill()
+    }
+
+    /** Status, health, and the way through to the sessions. */
+    private fun buildStatusCard(): LinearLayout {
+        statusPill = pill(getString(R.string.not_paired), textSecondary, surfaceAltColor).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
         }
-        val portLabel = TextView(this).apply {
-            text = "Port"
-            textSize = 16f
-            setPadding(0, 16, 0, 8)
+        heartbeatText = captionView().apply { textSize = 13f }
+        statusText = captionView().apply {
+            setTextColor(textSecondary)
+            visibility = View.GONE
         }
-        portField = EditText(this).apply {
-            hint = "8477"
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText("8477")
-            maxLines = 1
-            setPadding(24, 16, 24, 16)
-        }
-        pairButton = Button(this).apply { text = "Pair" }
-        scanButton = Button(this).apply { text = getString(R.string.scan_button) }
-        statusText = TextView(this).apply {
-            text = "Not paired"
-            setPadding(0, 16, 0, 0)
-        }
-        sessionsButton = Button(this).apply {
-            text = getString(R.string.sessions_button)
+        sessionsButton = primaryButton(getString(R.string.sessions_button)).apply {
             visibility = View.GONE
             setOnClickListener {
                 startActivity(Intent(this@SettingsActivity, SessionsActivity::class.java))
             }
         }
 
-        heartbeatText = TextView(this).apply {
-            textSize = 13f
-            setPadding(0, 4, 0, 0)
+        return card().apply {
+            addView(statusPill)
+            addSpaced(heartbeatText, 10)
+            addSpaced(statusText, 6)
+            addSpaced(sessionsButton, 16)
+        }
+    }
+
+    private fun buildDeliverySection(): LinearLayout {
+        val watchRow = switchRow(
+            getString(R.string.watch_notifications),
+            getString(R.string.watch_notifications_hint),
+            PrhPrefs.isWatchEnabled(this),
+        ) { checked ->
+            PrhPrefs.setWatchEnabled(this, checked)
+            warnIfNothingAlerts()
+        }
+        val notifRow = switchRow(
+            getString(R.string.phone_notifications),
+            getString(R.string.phone_notifications_hint),
+            PrhPrefs.isPhoneNotificationsEnabled(this),
+        ) { checked ->
+            PrhPrefs.setPhoneNotificationsEnabled(this, checked)
+            // Turning this on is worthless while POST_NOTIFICATIONS is denied —
+            // notify() is dropped without an error — so the ask happens at the
+            // moment the intent is expressed.
+            if (checked) requestNotificationPermission()
+            warnIfNothingAlerts()
         }
 
-        // isChecked before the listener, deliberately: attaching first would
-        // fire the callback for the value that was just read back out of prefs
-        // and write it straight in again, which is harmless here but is how
-        // toggle state ends up being "changed" by merely opening the screen.
-        watchCheck = CheckBox(this).apply {
-            text = getString(R.string.watch_notifications)
-            isChecked = PrhPrefs.isWatchEnabled(this@SettingsActivity)
-            setOnCheckedChangeListener { _, checked ->
-                PrhPrefs.setWatchEnabled(this@SettingsActivity, checked)
-                warnIfNothingAlerts()
-            }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            addSpaced(sectionLabel(getString(R.string.delivery_heading)), 28)
+            addSpaced(
+                card().apply {
+                    addView(watchRow, matchWrap())
+                    addView(divider())
+                    addView(notifRow, matchWrap())
+                },
+                8,
+            )
         }
-        notifCheck = CheckBox(this).apply {
-            text = getString(R.string.phone_notifications)
-            isChecked = PrhPrefs.isPhoneNotificationsEnabled(this@SettingsActivity)
-            setOnCheckedChangeListener { _, checked ->
-                PrhPrefs.setPhoneNotificationsEnabled(this@SettingsActivity, checked)
-                // Turning this on is worthless while POST_NOTIFICATIONS is
-                // denied — notify() would be dropped without an error — so the
-                // ask happens at the moment the intent is expressed.
-                if (checked) requestNotificationPermission()
-                warnIfNothingAlerts()
-            }
+    }
+
+    private fun buildPairingCard(): LinearLayout {
+        hostField = styledField("192.168.1.10")
+        portField = styledField("8477").apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText("8477")
         }
-
-        root.addView(hostLabel)
-        root.addView(hostField)
-        root.addView(portLabel)
-        root.addView(portField)
-        root.addView(pairButton)
-        root.addView(scanButton)
-        root.addView(statusText)
-        root.addView(sessionsButton)
-        root.addView(heading(getString(R.string.connection_heading)))
-        root.addView(heartbeatText.fullWidth())
-        root.addView(heading(getString(R.string.delivery_heading)))
-        root.addView(watchCheck.fullWidth())
-        root.addView(notifCheck.fullWidth())
-        scroll.addView(root)
-        setContentView(scroll)
-        scroll.padForSystemBars()
-
-        prefill()
-        pairButton.setOnClickListener { doPair() }
+        // Scan is the primary action because it is the only one that can
+        // start a pairing: `doPair` needs a one-time key, and the only way to
+        // get one is off the QR. Pair on its own is the second tap.
+        scanButton = primaryButton(getString(R.string.scan_button))
         scanButton.setOnClickListener { onScanClicked() }
+        pairButton = secondaryButton("Pair")
+        pairButton.setOnClickListener { doPair() }
+
+        return card().apply {
+            addView(sectionLabel(getString(R.string.host_label)), matchWrap())
+            addSpaced(hostField, 6)
+            addSpaced(sectionLabel(getString(R.string.port_label)), 16)
+            addSpaced(portField, 6)
+            addSpaced(scanButton, 20)
+            addSpaced(pairButton, 8)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -276,7 +295,7 @@ class SettingsActivity : ComponentActivity() {
         val hb = PrhPrefs.getHeartbeat(this)
         if (hb == null) {
             heartbeatText.text = getString(R.string.heartbeat_never)
-            heartbeatText.setTextColor(COLOR_MUTED)
+            heartbeatText.setTextColor(textFaint)
             return
         }
 
@@ -296,9 +315,9 @@ class SettingsActivity : ComponentActivity() {
         }
         heartbeatText.setTextColor(
             when {
-                !running || !hb.ok -> COLOR_BAD
-                stale -> COLOR_WARN
-                else -> COLOR_GOOD
+                !running || !hb.ok -> badColor
+                stale -> warnColor
+                else -> goodColor
             },
         )
     }
@@ -319,7 +338,10 @@ class SettingsActivity : ComponentActivity() {
      * so say it once rather than letting an agent block unnoticed.
      */
     private fun warnIfNothingAlerts() {
-        if (!watchCheck.isChecked && !notifCheck.isChecked) {
+        // Read back out of prefs rather than off the two switches: the write
+        // has already happened, so this cannot disagree with what the service
+        // will do.
+        if (!PrhPrefs.isWatchEnabled(this) && !PrhPrefs.isPhoneNotificationsEnabled(this)) {
             Toast.makeText(
                 this,
                 "Nothing will alert you now — prompts only appear inside the app",
@@ -328,25 +350,28 @@ class SettingsActivity : ComponentActivity() {
         }
     }
 
-    // -- small view helpers -------------------------------------------------
+    // -- status ---------------------------------------------------------------
 
-    private fun heading(label: String) = TextView(this).apply {
-        text = label
-        textSize = 13f
-        setTextColor(COLOR_MUTED)
-        setPadding(0, 32, 0, 4)
-    }.fullWidth()
-
-    /**
-     * The root centres its children horizontally, which leaves a label or a
-     * checkbox floating in the middle of the screen at its own measured width.
-     * Full-width children left-align their content instead.
-     */
-    private fun <T : View> T.fullWidth(): T = apply {
-        layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
+    /** The badge at the top of the connection card. */
+    private fun setStatusPill(label: String, paired: Boolean) {
+        statusPill.text = label.uppercase()
+        statusPill.setTextColor(if (paired) goodColor else textSecondary)
+        statusPill.background = roundedRect(
+            if (paired) goodSoft else surfaceAltColor,
+            radiusDp = 20,
         )
+    }
+
+    /** The line under the badge: progress, or why pairing failed. Hidden when
+     *  there is nothing to say, so the card does not keep a stale error. */
+    private fun setDetail(message: String?, isError: Boolean = false) {
+        if (message.isNullOrBlank()) {
+            statusText.visibility = View.GONE
+            return
+        }
+        statusText.visibility = View.VISIBLE
+        statusText.text = message
+        statusText.setTextColor(if (isError) badColor else textSecondary)
     }
 
     // -- deep link ---------------------------------------------------------
@@ -423,9 +448,16 @@ class SettingsActivity : ComponentActivity() {
             }
         }
 
-        if (PrhPrefs.isPaired(this)) {
-            statusText.text = "Paired"
-            sessionsButton.visibility = android.view.View.VISIBLE
+        val paired = PrhPrefs.isPaired(this)
+        setStatusPill(
+            getString(if (paired) R.string.paired else R.string.not_paired),
+            paired,
+        )
+        deliverySection.visibility = if (paired) View.VISIBLE else View.GONE
+
+        if (paired) {
+            setDetail(null)
+            sessionsButton.visibility = View.VISIBLE
             // Also asked here, not only on the pairing path: everyone who
             // paired before this was added is already installed and would
             // otherwise never be asked, leaving notifications permanently dead
@@ -448,7 +480,7 @@ class SettingsActivity : ComponentActivity() {
         // editable field invites it into clipboards and screenshots. It is
         // held in memory for this one pairing attempt.
         if (deepLinkKey != null) {
-            statusText.text = "Ready to pair with the scanned code"
+            setDetail("Scanned code ready — tap Pair")
         }
     }
 
@@ -479,7 +511,7 @@ class SettingsActivity : ComponentActivity() {
         val baseUrl = "https://$host:$port"
 
         pairButton.isEnabled = false
-        statusText.text = "Pairing…"
+        setDetail("Pairing…")
 
         scope.launch {
             try {
@@ -508,8 +540,11 @@ class SettingsActivity : ComponentActivity() {
                 deepLinkKey = null
 
                 withContext(Dispatchers.Main) {
-                    statusText.text = "Paired"
-                    sessionsButton.visibility = android.view.View.VISIBLE
+                    setStatusPill(getString(R.string.paired), paired = true)
+                    setDetail(null)
+                    sessionsButton.visibility = View.VISIBLE
+                    deliverySection.visibility = View.VISIBLE
+                    pairButton.isEnabled = true
                     Toast.makeText(this@SettingsActivity, "Paired", Toast.LENGTH_SHORT).show()
                     requestNotificationPermission()
                     requestBatteryExemption()
@@ -520,18 +555,24 @@ class SettingsActivity : ComponentActivity() {
                 // other than prh is answering on this address. Say which,
                 // because "handshake failed" sends people to the wrong place.
                 withContext(Dispatchers.Main) {
-                    statusText.text = "prh's TLS key is not the one this code vouches for. " +
-                        "Start pairing again in the editor and scan the new code."
+                    setDetail(
+                        "prh's TLS key is not the one this code vouches for. " +
+                            "Start pairing again in the editor and scan the new code.",
+                        isError = true,
+                    )
                     pairButton.isEnabled = true
                 }
             } catch (e: PrhClient.PairingClosed) {
                 withContext(Dispatchers.Main) {
-                    statusText.text = "Pairing is not open. Run \"Pebble Harness: Pair\" in the editor, then scan again."
+                    setDetail(
+                        "Pairing is not open. Run \"Pebble Harness: Pair\" in the editor, then scan again.",
+                        isError = true,
+                    )
                     pairButton.isEnabled = true
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    statusText.text = "Pairing failed: ${e.message}"
+                    setDetail("Pairing failed: ${e.message}", isError = true)
                     pairButton.isEnabled = true
                 }
             }
@@ -582,10 +623,5 @@ class SettingsActivity : ComponentActivity() {
          * a poll did not come back when it should have.
          */
         const val STALE_AFTER_MS = 90_000L
-
-        const val COLOR_GOOD = 0xFF2E7D32.toInt()
-        const val COLOR_WARN = 0xFFEF6C00.toInt()
-        const val COLOR_BAD = 0xFFC62828.toInt()
-        const val COLOR_MUTED = 0xFF888888.toInt()
     }
 }

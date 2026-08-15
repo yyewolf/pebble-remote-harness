@@ -73,10 +73,17 @@
           onNewIntent rather than stacking another copy of the same
           conversation behind it.
         -->
+        <!--
+          adjustResize: the reply composer is pinned to the bottom of the
+          window, so the window has to shrink for the keyboard rather than pan
+          — with the default the composer is simply pushed off-screen by the
+          IME it just opened.
+        -->
         <activity
             android:name=".ConversationActivity"
             android:exported="false"
             android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize"
             android:label="@string/conversation_title" />
 
         <service
