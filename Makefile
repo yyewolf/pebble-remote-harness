@@ -1,4 +1,4 @@
-.PHONY: all api api-test extension watchapp companion fmt clean help
+.PHONY: all api api-test extension vsix watchapp companion package fmt clean help
 
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
@@ -15,8 +15,10 @@ help:
 	@echo "api        build the prh daemon"
 	@echo "api-test   vet and test the Go module"
 	@echo "extension  compile the VSCode extension"
+	@echo "vsix       package the extension, prh binary included"
 	@echo "watchapp   build the .pbw for emery"
 	@echo "companion  build the Android debug APK"
+	@echo "package    build every installable artifact into dist/"
 	@echo "fmt        format everything that has a formatter available"
 	@echo "clean      remove build output"
 
@@ -30,6 +32,15 @@ api-test:
 
 extension:
 	cd extension && npm install && npm run compile
+
+# The VSIX carries prh itself, so installing the extension is the only step
+# needed on a fresh machine. Without this copy the daemon is only found if it
+# already happens to be on the box, which is exactly the assumption that makes
+# a package untestable.
+vsix: api extension
+	mkdir -p extension/bin
+	cp bin/prh extension/bin/prh
+	cd extension && npx --yes @vscode/vsce package --out ../bin/
 
 watchapp:
 	cd watchapp && $(PEBBLE) build

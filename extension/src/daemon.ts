@@ -47,6 +47,7 @@ export class Daemon implements vscode.Disposable {
   constructor(
     private readonly output: vscode.OutputChannel,
     private readonly secrets: vscode.SecretStorage,
+    private readonly extensionPath: string,
   ) {}
 
   get current(): DaemonState {
@@ -461,16 +462,42 @@ export class Daemon implements vscode.Disposable {
 
   private resolveBinary(binaryPath: string): string | undefined {
     if (binaryPath && fs.existsSync(binaryPath)) return binaryPath;
-    // Check common locations.
+    // The copy shipped inside the VSIX comes first, so a plain install works
+    // with nothing on the PATH. An explicit prh.binaryPath still wins above,
+    // which is what a developer running from a build tree wants.
     const candidates = [
+      path.join(this.extensionPath, 'bin', 'prh'),
       path.join(this.configDir(), 'prh'),
       path.join(os.homedir(), '.local', 'bin', 'prh'),
       '/usr/local/bin/prh',
     ];
     for (const c of candidates) {
-      if (fs.existsSync(c)) return c;
+      if (fs.existsSync(c)) {
+        this.ensureExecutable(c);
+        return c;
+      }
     }
     return undefined;
+  }
+
+  /**
+   * Restores the executable bit on the bundled binary.
+   *
+   * VSIX is a zip and the extension host does not reliably preserve unix file
+   * modes when it unpacks one, so a freshly installed prh can land as 0644 and
+   * fail to spawn with EACCES. Re-applying the bit is cheap and idempotent;
+   * failing to is not fatal here because the spawn error is the real report.
+   */
+  private ensureExecutable(bin: string): void {
+    try {
+      const mode = fs.statSync(bin).mode;
+      if ((mode & 0o111) === 0) {
+        fs.chmodSync(bin, mode | 0o755);
+        this.output.appendLine(`restored executable bit on ${bin}`);
+      }
+    } catch (err) {
+      this.output.appendLine(`could not chmod ${bin}: ${err}`);
+    }
   }
 
   // -- config writing -----------------------------------------------------

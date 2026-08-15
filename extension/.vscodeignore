@@ -1,0 +1,13 @@
+# Sources and build inputs: the VSIX ships out/, not what produced it.
+src/**
+tsconfig.json
+package-lock.json
+.vscode/**
+
+# No runtime dependencies, so nothing here belongs in the package.
+node_modules/**
+
+# Source maps point at files that are not shipped.
+out/**/*.map
+
+# bin/prh is deliberately NOT ignored — see the `vsix` target in the Makefile.

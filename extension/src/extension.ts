@@ -10,7 +10,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const output = vscode.window.createOutputChannel('Pebble Remote Harness');
   context.subscriptions.push(output);
 
-  daemon = new Daemon(output, context.secrets);
+  daemon = new Daemon(output, context.secrets, context.extensionUri.fsPath);
   context.subscriptions.push(daemon);
 
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
