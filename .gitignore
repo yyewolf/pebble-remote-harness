@@ -55,3 +55,6 @@ companion/local.properties
 
 # temporary Kilo probe plugin (not part of the project)
 .kilo/
+
+# npm pack output; the plugin is loaded from source, never from a tarball
+*.tgz

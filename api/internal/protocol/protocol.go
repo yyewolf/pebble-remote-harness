@@ -91,17 +91,108 @@ const (
 	ActionText   ReplyAction = "text"
 )
 
-// RegisterRequest trades the shared password for a per-device token.
+// -- Hop 1 authentication ---------------------------------------------------
+//
+// Three credentials with deliberately different lifetimes. See docs/protocol.md
+// for the reasoning; the short version is that nothing reusable may cross the
+// wire twice, because Hop 1 is plaintext HTTP on a LAN.
+//
+//  1. the pairing passphrase — crosses the wire exactly once per device, at
+//     registration, and is argon2id-hashed at rest
+//  2. the device secret — issued at registration, then never transmitted
+//     again; it only ever signs
+//  3. the session key — wrapped under the device secret at login, then only
+//     ever signs
+//
+// Every request after registration is authenticated by an HMAC over its own
+// method, path, date, nonce and body. A captured request is worthless: it
+// cannot be replayed (nonce), cannot be held (date), and cannot be retargeted
+// at another route (method and path are signed).
+
+// SigScheme is the first line of every canonical string. It exists so that a
+// future scheme change cannot be made to look like this one.
+const SigScheme = "PRH1"
+
+// Signature headers. All four are mandatory on a signed request.
+const (
+	// HeaderKeyID names the key that produced the signature: a device ID on
+	// POST /v1/login, a session key ID everywhere else.
+	HeaderKeyID = "X-Prh-Key"
+	HeaderDate  = "X-Prh-Date"  // unix seconds
+	HeaderNonce = "X-Prh-Nonce" // base64url, >= 16 bytes, single-use
+	HeaderSig   = "X-Prh-Sig"   // base64url HMAC-SHA256
+
+	// HeaderServerTime is returned on a skew rejection so the client can
+	// measure its offset and retry instead of failing forever. The current
+	// time is not a secret, so answering with it costs nothing.
+	HeaderServerTime = "X-Prh-Time"
+)
+
+// ClockLeewaySec bounds how far a request's date may be from the server's.
+//
+// Tight on purpose: the leeway is exactly the window in which a captured
+// request could be replayed if the nonce cache were ever bypassed. Ten seconds
+// is comfortable for two NTP-synced machines on the same LAN, and the
+// HeaderServerTime hint covers the case where one of them is not.
+const ClockLeewaySec = 10
+
+// NonceMinLen is the minimum accepted nonce length in decoded bytes. Below
+// this, collisions between honest clients become plausible and the replay
+// cache stops being a reliable defence.
+const NonceMinLen = 16
+
+// SessionTTLSec is how long a session key stays valid. Sessions are held in
+// memory only, so a prh restart invalidates every one of them — which is the
+// case the heartbeat exists to detect and repair.
+const SessionTTLSec = 12 * 3600
+
+// RegisterRequest trades the shared passphrase for a per-device secret. This
+// is the only request that carries the passphrase, and the only one that is
+// not signed — there is nothing to sign with yet.
 type RegisterRequest struct {
 	Password   string `json:"password"`
 	DeviceName string `json:"device_name"`
 	Platform   string `json:"platform"`
 }
 
+// RegisterResponse hands over the device secret. It is returned exactly once
+// and cannot be recovered afterwards; a device that loses it must re-pair with
+// the passphrase.
 type RegisterResponse struct {
-	DeviceID   string `json:"device_id"`
-	Token      string `json:"token"`
+	DeviceID     string `json:"device_id"`
+	DeviceSecret string `json:"device_secret"` // base64url, 32 bytes
+	ServerName   string `json:"server_name"`
+}
+
+// LoginRequest asks for a session key. The body names the device; possession
+// of the device secret is proven by the signature over this request, so the
+// secret itself stays off the wire.
+type LoginRequest struct {
+	DeviceID string `json:"device_id"`
+}
+
+// LoginResponse carries the session key sealed under a key derived from the
+// device secret, so that the session key is never transmitted in the clear
+// either.
+//
+//	wrapKey = HKDF-SHA256(deviceSecret, salt=WrapSalt, info="prh-session-wrap-v1")
+//	sessionKey = AES-256-GCM-Open(wrapKey, WrapNonce, WrappedKey, aad=KeyID)
+type LoginResponse struct {
+	KeyID      string `json:"key_id"`
+	WrapSalt   string `json:"wrap_salt"`   // base64url, 16 bytes
+	WrapNonce  string `json:"wrap_nonce"`  // base64url, 12 bytes
+	WrappedKey string `json:"wrapped_key"` // base64url, sealed 32-byte key
+	ExpiresAt  int64  `json:"expires_at"`  // unix seconds
 	ServerName string `json:"server_name"`
+}
+
+// HeartbeatResponse confirms a session is still live. The client uses a 401
+// here as its signal to log in again, which is how it recovers from a prh
+// restart without the user retyping anything.
+type HeartbeatResponse struct {
+	OK         bool  `json:"ok"`
+	ExpiresAt  int64 `json:"expires_at"`
+	ServerTime int64 `json:"server_time"`
 }
 
 // PollResponse answers GET /v1/poll. An empty Events with an unchanged cursor
