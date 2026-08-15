@@ -137,9 +137,15 @@ jobs:
         working-directory: extension
         run: npm ci
 
+      # vsce only treats --out as a directory if it already exists. Given a path
+      # that does not, it writes the package as a *file* by that name and then
+      # trips over its own trailing slash with ENOTDIR — so the mkdir is what
+      # makes this produce dist/<name>.vsix rather than a file called dist.
       - name: package
         working-directory: extension
-        run: npx --yes @vscode/vsce package --target '${{ matrix.target }}' --out ../dist/
+        run: |
+          mkdir -p ../dist
+          npx --yes @vscode/vsce package --target '${{ matrix.target }}' --out ../dist/
 
       - uses: actions/upload-artifact@v4
         with:
