@@ -82,7 +82,7 @@ func (r *Registry) NewSession(deviceID string) (*Session, *WrappedSession, error
 		return nil, nil, fmt.Errorf("auth: generating wrap nonce: %w", err)
 	}
 
-	sealed, err := sealSessionKey(secret, salt, nonce, []byte(keyID), sessionKey)
+	sealed, err := sealUnder(secret, salt, nonce, []byte(keyID), hkdfInfo, sessionKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -115,15 +115,19 @@ func (r *Registry) NewSession(deviceID string) (*Session, *WrappedSession, error
 	}, nil
 }
 
-// sealSessionKey derives the wrapping key and AES-256-GCM seals the session
-// key under it.
+// sealUnder derives a wrapping key from secret and AES-256-GCM seals plaintext
+// under it. Shared by the session wrap and the pairing wrap.
 //
 // AES-GCM rather than anything more exotic because the other end is Android,
 // where it is in the platform library; the companion must be able to open this
 // without pulling in a crypto dependency.
-func sealSessionKey(secret, salt, nonce, aad, sessionKey []byte) ([]byte, error) {
+//
+// info is what keeps the two uses apart. Two wraps deriving the same key from
+// the same secret would let a blob sealed for one purpose be opened as the
+// other, so every caller passes its own constant and none of them share.
+func sealUnder(secret, salt, nonce, aad []byte, info string, plaintext []byte) ([]byte, error) {
 	wrapKey := make([]byte, 32)
-	kdf := hkdf.New(sha256.New, secret, salt, []byte(hkdfInfo))
+	kdf := hkdf.New(sha256.New, secret, salt, []byte(info))
 	if _, err := io.ReadFull(kdf, wrapKey); err != nil {
 		return nil, fmt.Errorf("auth: deriving wrap key: %w", err)
 	}
@@ -136,7 +140,7 @@ func sealSessionKey(secret, salt, nonce, aad, sessionKey []byte) ([]byte, error)
 	if err != nil {
 		return nil, fmt.Errorf("auth: wrap gcm: %w", err)
 	}
-	return gcm.Seal(nil, nonce, sessionKey, aad), nil
+	return gcm.Seal(nil, nonce, plaintext, aad), nil
 }
 
 // Session resolves a key ID, rejecting expired sessions.

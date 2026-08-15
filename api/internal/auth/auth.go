@@ -84,6 +84,10 @@ type Registry struct {
 
 	// nonces backs replay rejection for signed requests.
 	nonces *nonceCache
+
+	// pairing is the currently-armed enrolment window, nil when shut. Not
+	// persisted: a window must never survive a restart the user did not watch.
+	pairing *pairingWindow
 }
 
 func NewRegistry(passwordHash string) *Registry {
