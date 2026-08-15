@@ -326,14 +326,49 @@ class PrhClient(
         if (sessionKey == null) {
             login()
         }
-        val first = exec(method, path, body, currentKey(), readTimeoutMs)
+        // execSigned has already dealt with skew, so a 401 surviving it means
+        // the session itself is gone.
+        val first = execSigned(method, path, body, currentKey(), readTimeoutMs)
         if (first.code != 401) return first
 
-        // Adopt the server's clock before retrying: if skew is the problem, a
-        // new session signed with the same wrong time fails identically.
-        first.serverTime?.let { clockOffsetSec = it - System.currentTimeMillis() / 1000 }
         login()
-        return exec(method, path, body, currentKey(), readTimeoutMs)
+        return execSigned(method, path, body, currentKey(), readTimeoutMs)
+    }
+
+    /**
+     * A signed request that corrects for clock skew and retries once.
+     *
+     * Every signed call goes through here, enrolment and login included. That
+     * matters more than it looks: a signature carries the sender's clock, and a
+     * phone whose clock is off by more than the leeway fails *every* request
+     * with a 401 that looks exactly like a bad credential. The very first
+     * request a phone makes — registration — is the most likely to hit it,
+     * because the app has had no prior response to learn an offset from.
+     *
+     * A skew rejection carries the server's clock in X-Prh-Time, so adopt it
+     * and sign again. Only one retry: if a correctly-dated signature is still
+     * refused, the problem is the key, not the clock.
+     *
+     * Trusting the server's clock is safe. It only shifts what *we* sign;
+     * prh still judges against its own clock, so a bogus value would make our
+     * requests fail rather than let stale ones through — and over pinned TLS
+     * the header comes from prh anyway.
+     */
+    private fun execSigned(
+        method: String,
+        path: String,
+        body: ByteArray?,
+        signing: SigningKey?,
+        readTimeoutMs: Int = 15_000,
+    ): Response {
+        val first = exec(method, path, body, signing, readTimeoutMs)
+        if (first.code != 401 || signing == null) return first
+
+        // No X-Prh-Time means this was not a skew rejection; nothing to fix.
+        val serverTime = first.serverTime ?: return first
+        clockOffsetSec = serverTime - System.currentTimeMillis() / 1000
+
+        return exec(method, path, body, signing, readTimeoutMs)
     }
 
     private fun currentKey(): SigningKey {
@@ -406,7 +441,7 @@ class PrhClient(
 
     /** Unsigned or device-signed JSON call used by register and login. */
     private fun doJson(method: String, path: String, body: ByteArray?, signing: SigningKey?): JSONObject {
-        val resp = exec(method, path, body, signing, readTimeoutMs = 15_000)
+        val resp = execSigned(method, path, body, signing, readTimeoutMs = 15_000)
         if (resp.code !in 200..299) {
             throw HttpException(resp.code, "HTTP ${resp.code}: ${resp.body}")
         }
