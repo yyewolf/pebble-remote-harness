@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -436,5 +437,44 @@ func TestPollDecisionsContextCancel(t *testing.T) {
 	_, err := h.PollDecisions(ctx, upID, 0, 5*time.Second)
 	if err != context.Canceled {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// A prh restart resets the in-memory sequence to zero while the companion
+// keeps the cursor it persisted. Without this, the phone polls with a cursor
+// nothing will ever exceed, gets 200 and an empty list, and silently misses
+// every event until the sequence climbs back past it. Seen on hardware.
+func TestPollRejectsACursorFromAPreviousEpoch(t *testing.T) {
+	h := New(50)
+	h.Publish(protocol.Envelope{Type: protocol.EventPerm})
+
+	// The client's cursor is far ahead of anything this daemon has issued.
+	_, err := h.Poll(context.Background(), 10, 0)
+	if !errors.Is(err, ErrCursorTooOld) {
+		t.Fatalf("err = %v, want ErrCursorTooOld so the client resets", err)
+	}
+
+	// After resetting, it sees the backlog.
+	resp, err := h.Poll(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatalf("poll after reset: %v", err)
+	}
+	if len(resp.Events) != 1 {
+		t.Fatalf("events after reset = %d, want 1", len(resp.Events))
+	}
+}
+
+// The boundary must stay usable: a cursor exactly at the newest event is a
+// caller that is simply up to date, not one from another epoch.
+func TestPollAcceptsACursorAtTheHead(t *testing.T) {
+	h := New(50)
+	h.Publish(protocol.Envelope{Type: protocol.EventPerm})
+
+	resp, err := h.Poll(context.Background(), h.Cursor(), 0)
+	if err != nil {
+		t.Fatalf("cursor at head rejected: %v", err)
+	}
+	if len(resp.Events) != 0 {
+		t.Fatalf("events = %d, want 0", len(resp.Events))
 	}
 }

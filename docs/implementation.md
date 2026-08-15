@@ -33,13 +33,16 @@ Trust the first column; re-check the second before relying on it.
 | TLS pin matches across Go, the wire, and the QR | **tested end to end** |
 | Pin survives a certificate reissue | **tested** |
 | Full flow (pair → enrol → login → poll) over TLS | **tested end to end** |
-| Android verifying this certificate | **not tested on hardware** |
+| Android verifying this certificate | **tested on hardware** (Pixel 8 Pro) |
+| Sealed enrolment from the phone over TLS | **tested on hardware** |
+| Clock-skew correction on first contact | **tested on hardware** (30s skew) |
+| Cursor reset after a daemon restart | **tested on hardware** |
 | Pairing window gates enrolment, closes after one device | **tested end to end** |
 | Sealed enrolment: capture yields nothing usable | **tested end to end** |
 | Admin routes absent from the TCP listener | **tested** |
 | Session wrap unwraps with the device secret only | **tested** |
 | Devices survive a `prh` restart | **tested** |
-| Companion re-login after a `prh` restart | **not tested on hardware** |
+| Companion re-login after a `prh` restart | **tested on hardware** |
 | Socket election + stale reclaim | **tested** |
 | Plugin routes absent from TCP | **tested** |
 | `app.START` wakes a closed watchapp | **tested on hardware** |
@@ -143,11 +146,9 @@ the other's upstream working.
   translation, ring-buffer eviction, the `410` cursor path, and the whole Hop 1
   auth surface. Nothing covers the plugin's decision-safety rules or the
   companion, and both would repay it.
-- **The companion has never spoken TLS on real hardware.** The pin recipe is
-  verified byte-for-byte against an independent client, but Conscrypt is not
-  BoringSSL-via-Go, and `usesCleartextTraffic` is still `true` in the manifest
-  for devices paired before TLS. Flip it to `false` once every phone has
-  re-paired.
+- **`usesCleartextTraffic` is still `true`** in the manifest, for devices
+  paired before TLS existed. Every phone here has now re-paired over https, so
+  this can be flipped to `false`.
 - **The OpenAPI spec is not vendored.** Regenerate it with the snippet at the
   end of `kilo-integration.md` when you need a shape that is not documented.
 
@@ -224,6 +225,15 @@ adb shell am broadcast -a com.getpebble.action.app.START \
 - Node's global `fetch` is undici and ignores `agent`; `rejectUnauthorized`
   has to go through `https.request` or the handshake fails silently and every
   health check reports the daemon dead.
+- A client cursor **ahead** of the hub's sequence used to return `200` with an
+  empty list, forever. The ring is in-memory, so a restart resets the sequence
+  while the companion keeps its persisted cursor: the phone went blind until
+  the sequence climbed back past it. `pollOnce` now answers `410` for that too,
+  and the client's existing reset path handles it.
+- Clock skew correction has to cover **enrolment and login**, not just
+  session-signed requests. The first request a phone ever makes is the most
+  likely to hit skew, because nothing has taught it an offset yet. A real
+  phone was 30s out of step.
 - Subcommands come first: `prh pair -config X`, not `prh -config X pair`. The
   latter starts the daemon and fails with "another prh is already running",
   which reads like a bug and is not.

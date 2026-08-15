@@ -351,6 +351,20 @@ func (h *Hub) pollOnce(cursor uint64) (protocol.PollResponse, error) {
 		return protocol.PollResponse{}, ErrCursorTooOld
 	}
 
+	// A cursor *ahead* of our sequence belongs to a previous daemon epoch. The
+	// ring is in-memory, so a prh restart resets the sequence to zero while the
+	// companion keeps the cursor it persisted — and every event published
+	// before the sequence climbs back past that number would be silently
+	// dropped, with the poll returning 200 and an empty list. Observed on
+	// hardware: a phone paired before a restart sat at cursor 10, missed the
+	// next event entirely, and only recovered once the sequence overtook it.
+	//
+	// Treat it the same as a cursor that fell off the ring: the client's
+	// reaction to 410 — reset and accept the gap — is exactly right here too.
+	if cursor > h.seq {
+		return protocol.PollResponse{}, ErrCursorTooOld
+	}
+
 	events := make([]protocol.Envelope, 0)
 	for i := range h.ring {
 		if h.ring[i].Seq > cursor {
