@@ -41,10 +41,6 @@ function sleep(ms) {
 export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
   const sock = socketPath()
 
-  // Fail open: no daemon, no harness, no noise. Not an error, not a toast.
-  // The user may simply not be running prh today.
-  if (!existsSync(sock)) return {}
-
   // Every request to prh goes over the unix socket; it is the only transport.
   //
   // `socketPath` is set on each request rather than on a shared http.Agent.
@@ -235,10 +231,46 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
     let backoff = 1000
 
     while (!state.stopped) {
+      // Registration lives inside the loop, not before it.
+      //
+      // A dead prh leaves its socket file behind, so the existsSync() gate at
+      // the top of the plugin passes and hello() then fails with
+      // ECONNREFUSED. Registering once at load meant that instance was silent
+      // for its whole life — indistinguishable from a plugin that never
+      // loaded, since nothing logs either. Retrying costs one connect attempt
+      // per backoff tick and makes "start prh after VSCode" work.
+      if (!state.upstreamId) {
+        // Fail open: no daemon, no harness, no noise. Not an error, not a
+        // toast — the user may simply not be running prh today. This is a
+        // stat() per backoff tick, so an unused install costs nothing.
+        //
+        // It is checked here rather than once at load because prh removes
+        // this file on a clean exit and recreates it on start. Gating at load
+        // meant every Kilo instance that happened to start before prh stayed
+        // dead for its entire life, silently, which is indistinguishable from
+        // a plugin that never loaded.
+        if (!existsSync(sock) || !(await hello())) {
+          backoff = Math.min(backoff * 2, 30000)
+          await sleep(backoff)
+          continue
+        }
+        // A fresh upstream has a fresh decision ring; keeping the old cursor
+        // would skip past everything queued for us.
+        state.cursor = 0
+        backoff = 1000
+      }
+
       try {
         const { status, json } = await get(
           `/plugin/v1/decisions?upstream_id=${state.upstreamId}&cursor=${state.cursor}&wait=30`,
         )
+        // prh restarted and has forgotten this upstream: 400 unknown
+        // upstream_id, or 410 once it is dropped mid-poll. Re-register rather
+        // than backing off against an ID that will never become valid again.
+        if (status === 400 || status === 410) {
+          state.upstreamId = null
+          continue
+        }
         if (status !== 200 || !json) {
           backoff = Math.min(backoff * 2, 30000)
           await sleep(backoff)
@@ -264,8 +296,9 @@ export const PrhPlugin = async ({ client, directory, project, serverUrl }) => {
     }
   }
 
-  await hello()
-  if (state.upstreamId) downlink()
+  // Not awaited: downlink() now owns registration and retries forever, so
+  // awaiting it would block plugin load until prh happened to be up.
+  downlink()
 
   return {
     /**
